@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 import argparse
+import base64
 import json
+import os
 import select
 import signal
 import ssl
 import sys
 import time
+from typing import Optional
 
 import paho.mqtt.client as mqtt
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 # Default configuration
 DEFAULTS = {
@@ -24,6 +31,52 @@ MQTT_ERRORS = {
     mqtt.MQTT_ERR_CONN_REFUSED: "Connection refused",
     mqtt.MQTT_ERR_NO_CONN: "No connection available",
 }
+
+
+class Encryptor:
+    """Handles AES-GCM encryption/decryption with key derivation and AAD"""
+
+    def __init__(self, password: Optional[str] = None, salt: bytes = b"", iterations: int = 210000):
+        self.key = None
+        if password:
+            if len(password) < 32:
+                raise ValueError("Encryption key must be at least 32 characters")
+            self.derive_key(password.encode(), salt, iterations)
+
+    def derive_key(self, password: bytes, salt: bytes, iterations: int):
+        """Derive a key from password using PBKDF2"""
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=iterations,
+            backend=default_backend(),
+        )
+        self.key = kdf.derive(password)
+
+    def encrypt(self, plaintext: bytes, aad: bytes) -> bytes:
+        """Encrypt data with AES-GCM using Additional Authenticated Data (AAD)"""
+        if not self.key:
+            return plaintext
+
+        nonce = os.urandom(12)
+        aesgcm = AESGCM(self.key)
+        ciphertext = aesgcm.encrypt(nonce, plaintext, aad)
+        return nonce + ciphertext
+
+    def decrypt(self, ciphertext: bytes, aad: bytes) -> bytes:
+        """Decrypt data with AES-GCM using Additional Authenticated Data (AAD)"""
+        if not self.key or len(ciphertext) < 12:
+            return ciphertext
+
+        nonce = ciphertext[:12]
+        ciphertext = ciphertext[12:]
+        aesgcm = AESGCM(self.key)
+        try:
+            return aesgcm.decrypt(nonce, ciphertext, aad)
+        except Exception as e:
+            sys.stderr.write(f"Decryption failed: {str(e)}\n")
+            return b""
 
 
 def load_profiles(filename):
@@ -160,7 +213,18 @@ def on_connect(client, userdata, flags, rc):
 
 def on_message(client, userdata, msg):
     """Callback for received messages"""
-    sys.stdout.buffer.write(msg.payload)
+    payload = msg.payload
+    encryptor = userdata.get("encryptor")
+
+    # Decrypt if encryption is enabled
+    if encryptor:
+        try:
+            payload = encryptor.decrypt(payload, msg.topic.encode())
+        except Exception as e:
+            sys.stderr.write(f"Decryption error: {str(e)}\n")
+            return
+
+    sys.stdout.buffer.write(payload)
     sys.stdout.buffer.flush()
 
 
@@ -189,6 +253,21 @@ def setup_mqtt_client(profile, args, topics, qos0_delay_seconds):
         "current_chunk": None,
         "qos0_delay": qos0_delay_seconds,
     }
+
+    # Set up encryption if configured
+    if "encryption_key" in profile:
+        try:
+            salt = (
+                base64.b64decode(profile["encryption_salt"])
+                if "encryption_salt" in profile
+                else b""
+            )
+            iterations = profile.get("encryption_iterations", 210000)
+            userdata["encryptor"] = Encryptor(profile["encryption_key"], salt, iterations)
+            sys.stderr.write("Encryption enabled\n")
+        except Exception as e:
+            sys.stderr.write(f"Encryption setup failed: {str(e)}\n")
+            sys.exit(1)
 
     client = mqtt.Client(clean_session=True, userdata=userdata)
 
@@ -307,6 +386,15 @@ def send_data(client, userdata, data, retry=False):
     """Publish data to MQTT broker with error handling"""
     topic = userdata["topics"]["publish"]
     qos = userdata["qos"]
+    encryptor = userdata.get("encryptor")
+
+    # Encrypt data if encryption is enabled
+    if encryptor:
+        try:
+            data = encryptor.encrypt(data, topic.encode())
+        except Exception as e:
+            sys.stderr.write(f"Encryption error: {str(e)}\n")
+            return
 
     result = client.publish(topic, data, qos=qos)
 
