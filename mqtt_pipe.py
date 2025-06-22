@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 import argparse
 import base64
+import contextlib
 import json
+import logging
 import os
 import select
 import signal
 import ssl
 import sys
 import time
-from typing import Optional
+from typing import Dict, Optional, Tuple, TypedDict
 
 import paho.mqtt.client as mqtt
 from cryptography.hazmat.backends import default_backend
@@ -33,6 +35,34 @@ MQTT_ERRORS = {
 }
 
 
+# Type definitions
+class ProfileType(TypedDict):
+    host: str
+    port: int
+    username: Optional[str]
+    password: Optional[str]
+    tls: bool
+    insecure: bool
+    ca_certs: Optional[str]
+    certfile: Optional[str]
+    keyfile: Optional[str]
+    encryption_key: Optional[str]
+    encryption_salt: Optional[str]
+    encryption_iterations: int
+
+
+class UserDataType(TypedDict):
+    topics: Dict[str, str]
+    disconnected: Optional[int]
+    qos: int
+    pending_count: int
+    max_pending: int
+    current_chunk: Optional[bytes]
+    qos0_delay: float
+    logger: logging.Logger
+    encryptor: Optional["Encryptor"]
+
+
 class Encryptor:
     """Handles AES-GCM encryption/decryption with key derivation and AAD"""
 
@@ -42,6 +72,19 @@ class Encryptor:
             if len(password) < 32:
                 raise ValueError("Encryption key must be at least 32 characters")
             self.derive_key(password.encode(), salt, iterations)
+
+    def __del__(self):
+        """Securely wipe key from memory"""
+        if self.key:
+            # Overwrite key in memory
+            try:
+                for i in range(len(self.key)):
+                    self.key[i : i + 1] = b"\x00"
+            except TypeError:
+                # Key is immutable bytes, we can't modify it
+                pass
+            finally:
+                self.key = None
 
     def derive_key(self, password: bytes, salt: bytes, iterations: int):
         """Derive a key from password using PBKDF2"""
@@ -75,79 +118,103 @@ class Encryptor:
         try:
             return aesgcm.decrypt(nonce, ciphertext, aad)
         except Exception as e:
-            sys.stderr.write(f"Decryption failed: {str(e)}\n")
-            return b""
+            raise ValueError(f"Decryption failed: {str(e)}") from e
 
 
-def load_profiles(filename):
-    """Load MQTT profiles from JSON file"""
+def load_profiles(filename: str) -> Dict[str, ProfileType]:
+    """Load MQTT profiles from JSON file with validation"""
     try:
         with open(filename, "r") as f:
-            return json.load(f)
+            profiles = json.load(f)
+
+            # Basic profile validation
+            for name, profile in profiles.items():
+                if "host" not in profile:
+                    raise ValueError(f"Profile '{name}' missing 'host' field")
+                if "port" not in profile:
+                    raise ValueError(f"Profile '{name}' missing 'port' field")
+
+            return profiles
     except Exception as e:
-        sys.stderr.write(f"Error loading profiles: {str(e)}\n")
+        logging.error(f"Error loading profiles: {str(e)}")
         sys.exit(1)
 
 
-def setup_arg_parser():
+def setup_arg_parser() -> argparse.ArgumentParser:
     """Create and configure argument parser"""
-    parser = argparse.ArgumentParser(description="MQTT Netcat-like Tool")
+    parser = argparse.ArgumentParser(
+        description="MQTT Netcat-like Tool",
+        epilog="Example: ./mqttnc.py listen myapp profiles.json production",
+    )
 
     # Positional arguments
     parser.add_argument(
-        "mode", choices=["listen", "connect"], help="Operation mode: listen or connect"
+        "mode",
+        choices=["listen", "connect"],
+        help="Operation mode: 'listen' waits for connections, 'connect' initiates connections",
     )
     parser.add_argument("prefix", help="Topic prefix for communication")
     parser.add_argument("profiles_file", help="JSON file containing MQTT profiles")
     parser.add_argument("profile_name", help="Profile name to use from profiles file")
 
     # Performance parameters
-    parser.add_argument(
+    perf_group = parser.add_argument_group("Performance Parameters")
+    perf_group.add_argument(
         "--qos",
         type=int,
         choices=[0, 1, 2],
         default=DEFAULTS["QOS"],
         help=f"Quality of Service level (default: {DEFAULTS['QOS']})",
     )
-    parser.add_argument(
+    perf_group.add_argument(
         "--keepalive",
         type=int,
         default=DEFAULTS["KEEPALIVE"],
         help=f"Keepalive interval in seconds (default: {DEFAULTS['KEEPALIVE']})",
     )
-    parser.add_argument(
+    perf_group.add_argument(
         "--chunk-size",
         type=int,
         default=DEFAULTS["CHUNK_SIZE"],
         help=f"Chunk size for reading stdin (bytes, default: {DEFAULTS['CHUNK_SIZE']})",
     )
-    parser.add_argument(
+    perf_group.add_argument(
         "--max-pending",
         type=int,
         default=DEFAULTS["MAX_PENDING"],
         help=f"Max pending acknowledgments before throttling (default: {DEFAULTS['MAX_PENDING']})",
     )
-    parser.add_argument(
+    perf_group.add_argument(
         "--qos0-delay",
         type=float,
         default=DEFAULTS["QOS0_DELAY_MS"],
         help=f"Delay between QoS 0 sends in milliseconds (default: {DEFAULTS['QOS0_DELAY_MS']} ms)",
     )
 
+    # Logging control
+    log_group = parser.add_argument_group("Logging Control")
+    log_group.add_argument(
+        "-v", "--verbose", action="store_true", help="Enable verbose debug logging"
+    )
+    log_group.add_argument(
+        "-q", "--quiet", action="store_true", help="Reduce output to warnings and errors only"
+    )
+    log_group.add_argument("--log-file", help="File to write logs to (default: stderr)")
+
     return parser
 
 
-def validate_arguments(args):
+def validate_arguments(args: argparse.Namespace, logger: logging.Logger) -> float:
     """Validate and warn about problematic argument values"""
     # Validate chunk size
     if args.chunk_size < 256:
-        sys.stderr.write("Warning: Small chunk sizes (<256B) may reduce performance\n")
+        logger.warning("Small chunk sizes (<256B) may reduce performance")
     elif args.chunk_size > 1024 * 1024:
-        sys.stderr.write("Warning: Large chunk sizes (>1MB) may cause buffer issues\n")
+        logger.warning("Large chunk sizes (>1MB) may cause buffer issues")
 
     # Validate max pending
     if args.max_pending < 1:
-        sys.stderr.write("Max pending must be at least 1\n")
+        logger.error("Max pending must be at least 1")
         sys.exit(1)
 
     # Convert milliseconds to seconds for internal use
@@ -155,24 +222,24 @@ def validate_arguments(args):
 
     # Validate QoS 0 delay
     if args.qos0_delay < 0:
-        sys.stderr.write("QoS 0 delay must be non-negative\n")
+        logger.error("QoS 0 delay must be non-negative")
         sys.exit(1)
     elif args.qos0_delay == 0:
-        sys.stderr.write("Warning: Zero QoS 0 delay may overwhelm broker/receiver\n")
+        logger.warning("Zero QoS 0 delay may overwhelm broker/receiver")
     elif args.qos0_delay > 100:  # 100ms
-        sys.stderr.write("Warning: Large QoS 0 delay (>100ms) may reduce throughput\n")
+        logger.warning("Large QoS 0 delay (>100ms) may reduce throughput")
 
     return qos0_delay_seconds
 
 
-def get_topics(mode, prefix):
+def get_topics(mode: str, prefix: str) -> Dict[str, str]:
     """Determine publish/subscribe topics based on operation mode"""
     if mode == "listen":
         return {"subscribe": f"{prefix}/listen", "publish": f"{prefix}/connect"}
     return {"subscribe": f"{prefix}/connect", "publish": f"{prefix}/listen"}
 
 
-def configure_tls(client, profile):
+def configure_tls(client: mqtt.Client, profile: ProfileType, logger: logging.Logger):
     """Configure TLS settings for MQTT client"""
     if not profile.get("tls", False):
         return
@@ -182,6 +249,7 @@ def configure_tls(client, profile):
         "certfile": profile.get("certfile"),
         "keyfile": profile.get("keyfile"),
         "cert_reqs": ssl.CERT_REQUIRED,
+        "tls_version": ssl.PROTOCOL_TLS_CLIENT,
     }
 
     # Allow self-signed certificates if requested
@@ -194,67 +262,84 @@ def configure_tls(client, profile):
     try:
         client.tls_set(**tls_args)
         client.tls_insecure_set(profile.get("insecure", False))
+        logger.debug("TLS configuration applied")
     except Exception as e:
-        sys.stderr.write(f"TLS setup error: {str(e)}\n")
+        logger.error(f"TLS setup error: {str(e)}")
         sys.exit(1)
 
 
-def on_connect(client, userdata, flags, rc):
+def on_connect(client: mqtt.Client, userdata: UserDataType, flags: Dict, rc: int):
     """Callback when connection to broker is established"""
+    logger = userdata["logger"]
+    topics = userdata["topics"]
+
     if rc == 0:
-        client.subscribe(userdata["topics"]["subscribe"], qos=userdata["qos"])
-        sys.stderr.write(
-            f"Connected to broker, subscribed to {userdata['topics']['subscribe']} "
-            f"(QoS: {userdata['qos']})\n"
-        )
+        client.subscribe(topics["subscribe"], qos=userdata["qos"])
+        logger.info(f"Connected to broker, subscribed to {topics['subscribe']}")
+        logger.debug(f"Connection flags: {flags}, QoS: {userdata['qos']}")
     else:
-        sys.stderr.write(f"Connection failed with code {rc}\n")
+        logger.error(f"Connection failed with code {rc}")
+        userdata["disconnected"] = rc
 
 
-def on_message(client, userdata, msg):
+def on_message(client: mqtt.Client, userdata: UserDataType, msg: mqtt.MQTTMessage):
     """Callback for received messages"""
-    payload = msg.payload
+    logger = userdata["logger"]
     encryptor = userdata.get("encryptor")
 
-    # Decrypt if encryption is enabled
-    if encryptor:
-        try:
+    logger.debug(
+        f"Received message on {msg.topic} " f"(QoS: {msg.qos}, Size: {len(msg.payload)} bytes)"
+    )
+
+    try:
+        payload = msg.payload
+
+        # Decrypt if encryption is enabled
+        if encryptor:
             payload = encryptor.decrypt(payload, msg.topic.encode())
+            logger.debug("Message decrypted successfully")
+
+        # Write to stdout with error handling
+        try:
+            sys.stdout.buffer.write(payload)
+            sys.stdout.buffer.flush()
+        except BrokenPipeError:
+            logger.warning("Broken pipe - output closed")
+            client.disconnect()
         except Exception as e:
-            sys.stderr.write(f"Decryption error: {str(e)}\n")
-            return
+            logger.error(f"Error writing to stdout: {str(e)}")
 
-    sys.stdout.buffer.write(payload)
-    sys.stdout.buffer.flush()
+    except Exception as e:
+        logger.error(f"Message processing error: {str(e)}")
 
 
-def on_disconnect(client, userdata, rc):
+def on_disconnect(client: mqtt.Client, userdata: UserDataType, rc: int):
     """Callback when disconnected from broker"""
+    logger = userdata["logger"]
     userdata["disconnected"] = rc
     if rc != 0:
         message = MQTT_ERRORS.get(rc, f"Unexpected disconnect (rc: {rc})")
-        sys.stderr.write(f"{message}\n")
+        logger.error(message)
+    else:
+        logger.info("Disconnected from broker")
 
 
-def on_publish(client, userdata, mid):
+def on_publish(client: mqtt.Client, userdata: UserDataType, mid: int):
     """Callback when message is acknowledged by broker"""
     userdata["pending_count"] -= 1
+    logger = userdata["logger"]
+    logger.debug(f"Message acknowledged (mid: {mid})")
 
 
-def setup_mqtt_client(profile, args, topics, qos0_delay_seconds):
-    """Create and configure MQTT client"""
-    # Userdata for sharing state with callbacks
-    userdata = {
-        "topics": topics,
-        "disconnected": None,
-        "qos": args.qos,
-        "pending_count": 0,
-        "max_pending": args.max_pending,
-        "current_chunk": None,
-        "qos0_delay": qos0_delay_seconds,
-    }
+def on_log(client: mqtt.Client, userdata: UserDataType, level: int, buf: str):
+    """Callback for MQTT client logging"""
+    logger = userdata["logger"]
+    level_name = logging.getLevelName(level)
+    logger.debug(f"[MQTT/{level_name}] {buf}")
 
-    # Set up encryption if configured
+
+def setup_encryption(profile: ProfileType, userdata: UserDataType):
+    """Set up encryption if configured"""
     if "encryption_key" in profile:
         try:
             salt = (
@@ -264,12 +349,45 @@ def setup_mqtt_client(profile, args, topics, qos0_delay_seconds):
             )
             iterations = profile.get("encryption_iterations", 210000)
             userdata["encryptor"] = Encryptor(profile["encryption_key"], salt, iterations)
-            sys.stderr.write("Encryption enabled\n")
+            logger = userdata["logger"]
+            logger.info("Encryption enabled")
+            logger.debug(f"Using salt: {base64.b64encode(salt).decode()}")
+            logger.debug(f"PBKDF2 iterations: {iterations}")
         except Exception as e:
-            sys.stderr.write(f"Encryption setup failed: {str(e)}\n")
+            userdata["logger"].error(f"Encryption setup failed: {str(e)}")
             sys.exit(1)
 
-    client = mqtt.Client(clean_session=True, userdata=userdata)
+
+def setup_mqtt_client(
+    profile: ProfileType,
+    args: argparse.Namespace,
+    topics: Dict[str, str],
+    qos0_delay_seconds: float,
+    logger: logging.Logger,
+) -> Tuple[mqtt.Client, UserDataType]:
+    """Create and configure MQTT client"""
+    # Userdata for sharing state with callbacks
+    userdata: UserDataType = {
+        "topics": topics,
+        "disconnected": None,
+        "qos": args.qos,
+        "pending_count": 0,
+        "max_pending": args.max_pending,
+        "current_chunk": None,
+        "qos0_delay": qos0_delay_seconds,
+        "logger": logger,
+        "encryptor": None,
+    }
+
+    # Set up encryption
+    setup_encryption(profile, userdata)
+
+    # Generate client ID with mode and timestamp
+    client_id = f"mqttnc_{args.mode}_{int(time.time())}"
+    client = mqtt.Client(client_id=client_id, clean_session=True, userdata=userdata)
+
+    # Configure MQTT logging
+    client.on_log = on_log
 
     # Register callbacks
     client.on_connect = on_connect
@@ -279,62 +397,110 @@ def setup_mqtt_client(profile, args, topics, qos0_delay_seconds):
 
     # Set credentials if available
     if "username" in profile and "password" in profile:
-        client.username_pw_set(profile["username"].strip(), profile["password"].strip())
+        username = profile["username"].strip()
+        password = profile["password"].strip()
+        client.username_pw_set(username, password)
+        logger.debug(f"Using credentials for user: {username}")
 
     # Configure TLS
-    configure_tls(client, profile)
+    configure_tls(client, profile, logger)
 
     # Connect to broker with error handling
     try:
+        logger.debug(
+            f"Connecting to {profile['host']}:{profile['port']} " f"(Keepalive: {args.keepalive}s)"
+        )
         client.connect(profile["host"], int(profile["port"]), args.keepalive)
     except ConnectionRefusedError:
-        sys.stderr.write("Connection refused. Check broker availability and port.\n")
+        logger.error("Connection refused. Check broker availability and port.")
         sys.exit(1)
     except ssl.SSLError as e:
-        sys.stderr.write(f"TLS handshake failed: {str(e)}\n")
+        logger.error(f"TLS handshake failed: {str(e)}")
         sys.exit(1)
     except Exception as e:
-        sys.stderr.write(f"Connection error: {str(e)}\n")
+        logger.error(f"Connection error: {str(e)}")
         sys.exit(1)
 
     return client, userdata
 
 
-def main_loop(client, userdata, chunk_size):
+def setup_logging(verbose: bool, quiet: bool, log_file: Optional[str] = None) -> logging.Logger:
+    """Configure logging system with proper levels"""
+    logger = logging.getLogger("mqttnc")
+
+    # Set base logging level
+    if verbose:
+        logger.setLevel(logging.DEBUG)
+    elif quiet:
+        logger.setLevel(logging.WARNING)
+    else:
+        logger.setLevel(logging.INFO)
+
+    # Clear any existing handlers
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+
+    # Create formatter
+    formatter = logging.Formatter(
+        "%(asctime)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    )
+
+    # Create file handler if specified
+    if log_file:
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    else:
+        # Create console handler
+        console_handler = logging.StreamHandler(sys.stderr)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+
+    return logger
+
+
+def main_loop(client: mqtt.Client, userdata: UserDataType, chunk_size: int):
     """Main processing loop with throttling and I/O handling"""
+    logger = userdata["logger"]
     running = True
     immediate_shutdown = False
     last_send_time = 0
 
+    logger.debug("Starting main processing loop")
+    logger.debug(f"Chunk size: {chunk_size} bytes")
+    logger.debug(f"Max pending: {userdata['max_pending']}")
+    logger.debug(f"QoS 0 delay: {userdata['qos0_delay']*1000:.1f}ms")
+
+    # Set up signal handling
     # Signal handler for graceful shutdown
     def signal_handler(sig, frame):
         nonlocal running
         nonlocal immediate_shutdown
         if running:
             # First Ctrl+C - initiate graceful shutdown
-            sys.stderr.write("\nShutting down...\n")
+            logger.info("Shutting down...")
             running = False
         elif not immediate_shutdown:
             # Second Ctrl+C - force exit without sending remaining data
             immediate_shutdown = True
-            sys.stderr.write("\nForce shutdown requested. Disconnecting client...\n")
+            logger.warning("Force shutdown requested. Disconnecting mqtt client...")
             client.disconnect()
             client.loop_stop()
             sys.exit(1)
         else:
-            # Third Ctrl+C - force exit without closing mqtt client
-            sys.stderr.write("\nForce IMMEDIATE shutdown requested. Exiting.\n")
+            # Third Ctrl+C - force exit immediately; without closing mqtt client
+            logger.error("Force IMMEDIATE shutdown requested")
             sys.exit(1)
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
     try:
-        while running:
+        while running and not immediate_shutdown:
             # Check for disconnects
             if userdata["disconnected"] is not None:
                 if userdata["disconnected"] != 0:
-                    sys.stderr.write("Disconnected from broker, exiting.\n")
+                    logger.error("Disconnected from broker, exiting.")
                 break
 
             # Determine if we can send more data
@@ -343,11 +509,20 @@ def main_loop(client, userdata, chunk_size):
                 # QoS 1/2: Check pending acknowledgments
                 if userdata["pending_count"] >= userdata["max_pending"]:
                     credit_available = False
+                    logger.debug(
+                        f"Throttling: {userdata['pending_count']}/"
+                        f"{userdata['max_pending']} pending messages"
+                    )
             else:
                 # QoS 0: Rate limit using specified delay
                 current_time = time.monotonic()
                 if current_time - last_send_time < userdata["qos0_delay"]:
                     credit_available = False
+                    elapsed = (current_time - last_send_time) * 1000
+                    logger.debug(
+                        f"QoS0 throttling: {elapsed:.1f}ms since last send "
+                        f"(limit: {userdata['qos0_delay']*1000:.1f}ms)"
+                    )
                 else:
                     last_send_time = current_time
 
@@ -356,13 +531,16 @@ def main_loop(client, userdata, chunk_size):
 
             if rlist and credit_available:
                 # Read and send new data
+                logger.debug(f"Reading stdin (chunk size: {chunk_size})")
                 data = sys.stdin.buffer.read1(chunk_size)
                 if not data:  # EOF
+                    logger.debug("EOF reached on stdin")
                     break
                 send_data(client, userdata, data)
 
             # Retry any failed chunks
             elif userdata["current_chunk"] and credit_available:
+                logger.debug("Retrying previous chunk")
                 send_data(client, userdata, userdata["current_chunk"], retry=True)
 
             # Brief pause when throttled
@@ -370,66 +548,99 @@ def main_loop(client, userdata, chunk_size):
                 sleep_time = min(0.01, userdata["qos0_delay"])
                 time.sleep(sleep_time)
 
-    except BrokenPipeError:
-        pass  # Output closed, normal termination
-    except KeyboardInterrupt:
-        pass  # User-initiated termination
     except Exception as e:
-        sys.stderr.write(f"Runtime error: {str(e)}\n")
+        logger.error(f"Runtime error: {str(e)}")
     finally:
         # Clean up resources
-        client.disconnect()
-        client.loop_stop()
+        logger.debug("Cleaning up resources")
+        with contextlib.suppress(Exception):
+            client.disconnect()
+            client.loop_stop()
+        logger.debug("Cleanup complete")
 
 
-def send_data(client, userdata, data, retry=False):
+def send_data(client: mqtt.Client, userdata: UserDataType, data: bytes, retry: bool = False):
     """Publish data to MQTT broker with error handling"""
+    logger = userdata["logger"]
     topic = userdata["topics"]["publish"]
     qos = userdata["qos"]
     encryptor = userdata.get("encryptor")
 
-    # Encrypt data if encryption is enabled
-    if encryptor:
-        try:
+    action = "Retrying" if retry else "Sending"
+    logger.debug(
+        f"{action} {len(data)} bytes to {topic} " f"(QoS: {qos}, Encrypted: {bool(encryptor)})"
+    )
+
+    try:
+        # Encrypt data if encryption is enabled
+        if encryptor:
             data = encryptor.encrypt(data, topic.encode())
-        except Exception as e:
-            sys.stderr.write(f"Encryption error: {str(e)}\n")
-            return
+            logger.debug(f"Encrypted payload size: {len(data)} bytes")
 
-    result = client.publish(topic, data, qos=qos)
+        result = client.publish(topic, data, qos=qos)
 
-    if result.rc == mqtt.MQTT_ERR_SUCCESS:
-        if qos > 0:
-            userdata["pending_count"] += 1
-        if retry:
-            userdata["current_chunk"] = None  # Clear stored chunk on successful retry
-    else:
-        error_msg = f"{'Retry' if retry else 'Publish'} failed (rc: {result.rc})"
+        if result.rc == mqtt.MQTT_ERR_SUCCESS:
+            if qos > 0:
+                userdata["pending_count"] += 1
+            if retry:
+                userdata["current_chunk"] = None  # Clear stored chunk on successful retry
+
+            if qos > 0:
+                logger.debug(
+                    f"Message sent (mid: {result.mid}), " f"pending: {userdata['pending_count']}"
+                )
+            else:
+                logger.debug("Message sent (QoS 0)")
+        else:
+            error_msg = f"{'Retry' if retry else 'Publish'} failed (rc: {result.rc})"
+            if not retry:
+                error_msg += ", storing for retry"
+                userdata["current_chunk"] = data
+            logger.error(error_msg)
+
+    except Exception as e:
+        logger.error(f"Error sending data: {str(e)}")
         if not retry:
-            error_msg += ", storing for retry"
             userdata["current_chunk"] = data
-        sys.stderr.write(f"{error_msg}\n")
 
 
 def main():
     """Main application entry point"""
-    # Parse and validate arguments
+    # Parse arguments
     parser = setup_arg_parser()
     args = parser.parse_args()
-    qos0_delay_seconds = validate_arguments(args)
+
+    # Set up logging
+    logger = setup_logging(args.verbose, args.quiet, args.log_file)
+
+    # Validate arguments
+    qos0_delay_seconds = validate_arguments(args, logger)
 
     # Load MQTT profile
     profiles = load_profiles(args.profiles_file)
     profile = profiles.get(args.profile_name)
     if not profile:
-        sys.stderr.write(f"Profile '{args.profile_name}' not found\n")
+        logger.error(f"Profile '{args.profile_name}' not found")
         sys.exit(1)
 
     # Determine topics
     topics = get_topics(args.mode, args.prefix)
 
+    # Log configuration details
+    logger.info(f"Starting in {args.mode} mode with prefix: {args.prefix}")
+    logger.debug(f"Configuration: {json.dumps(vars(args), indent=2)}")
+    logger.debug(f"QoS0 delay: {qos0_delay_seconds:.6f}s")
+
+    # Redact sensitive information in debug output
+    safe_profile = profile.copy()
+    if "password" in safe_profile:
+        safe_profile["password"] = "***REDACTED***"
+    if "encryption_key" in safe_profile:
+        safe_profile["encryption_key"] = "***REDACTED***"
+    logger.debug(f"Profile details: {json.dumps(safe_profile, indent=2)}")
+
     # Setup MQTT client
-    client, userdata = setup_mqtt_client(profile, args, topics, qos0_delay_seconds)
+    client, userdata = setup_mqtt_client(profile, args, topics, qos0_delay_seconds, logger)
 
     # Start MQTT network loop
     client.loop_start()
