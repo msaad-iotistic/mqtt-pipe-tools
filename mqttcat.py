@@ -12,6 +12,7 @@ import ssl
 import sys
 import threading
 import time
+import zlib  # Added for compression
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypedDict, Union
 
 import paho.mqtt.client as mqtt
@@ -27,6 +28,7 @@ DEFAULTS = {
     "KEEPALIVE": 60,
     "MAX_PENDING": 10,
     "QOS0_DELAY_MS": 1,
+    "COMPRESSION_LEVEL": 0,  # 0 = no compression, 1-9 = compression levels
 }
 
 # MQTT error mapping
@@ -35,6 +37,15 @@ MQTT_ERRORS = {
     mqtt.MQTT_ERR_CONN_REFUSED: "Connection refused",
     mqtt.MQTT_ERR_NO_CONN: "No connection available",
 }
+
+# Compression constants
+COMPRESSION_NONE = 0
+COMPRESSION_DEFLATE = 1
+COMPRESSION_TYPES = {
+    "none": COMPRESSION_NONE,
+    "deflate": COMPRESSION_DEFLATE,
+}
+COMPRESSION_NAMES = {v: k for k, v in COMPRESSION_TYPES.items()}
 
 
 # Type definitions
@@ -51,6 +62,8 @@ class ProfileType(TypedDict):
     encryption_key: Optional[str]
     encryption_salt: Optional[str]
     encryption_iterations: int
+    compression_type: int  # Added compression type
+    compression_level: int  # Added compression level
 
 
 class UserDataType(TypedDict):
@@ -63,6 +76,61 @@ class UserDataType(TypedDict):
     qos0_delay: float
     logger: logging.Logger
     encryptor: Optional["Encryptor"]
+    compressor: "Compressor"  # Added compressor
+
+
+class Compressor:
+    """Handles data compression/decompression with thread safety"""
+
+    def __init__(self, compression_type: int = COMPRESSION_NONE, level: int = 6):
+        self.compression_type = compression_type
+        self.level = level
+        # Use thread-local storage for zlib objects
+        self._local = threading.local()
+
+    def compress(self, data: bytes) -> bytes:
+        """Compress data based on configured compression type"""
+        if self.compression_type == COMPRESSION_NONE or not data:
+            return data
+
+        # Initialize thread-local compressor if needed
+        if not hasattr(self._local, "compressor"):
+            if self.compression_type == COMPRESSION_DEFLATE:
+                self._local.compressor = zlib.compressobj(self.level)
+            else:
+                return data
+
+        # Compress the data
+        try:
+            if self.compression_type == COMPRESSION_DEFLATE:
+                compressed = self._local.compressor.compress(data)
+                compressed += self._local.compressor.flush(zlib.Z_SYNC_FLUSH)
+                return compressed
+        except Exception as e:
+            raise RuntimeError(f"Compression failed: {str(e)}")
+
+        return data
+
+    def decompress(self, data: bytes) -> bytes:
+        """Decompress data based on configured compression type"""
+        if self.compression_type == COMPRESSION_NONE or not data:
+            return data
+
+        # Initialize thread-local decompressor if needed
+        if not hasattr(self._local, "decompressor"):
+            if self.compression_type == COMPRESSION_DEFLATE:
+                self._local.decompressor = zlib.decompressobj()
+            else:
+                return data
+
+        # Decompress the data
+        try:
+            if self.compression_type == COMPRESSION_DEFLATE:
+                return self._local.decompressor.decompress(data)
+        except Exception as e:
+            raise RuntimeError(f"Decompression failed: {str(e)}")
+
+        return data
 
 
 class Encryptor:
@@ -138,6 +206,8 @@ class MQTTNetcat:
         chunk_size: int = DEFAULTS["CHUNK_SIZE"],
         max_pending: int = DEFAULTS["MAX_PENDING"],
         qos0_delay: float = DEFAULTS["QOS0_DELAY_MS"],
+        compression_type: int = DEFAULTS["COMPRESSION_LEVEL"],  # Added compression type
+        compression_level: int = 6,  # Added compression level
         verbose: bool = False,
         quiet: bool = False,
         log_file: Optional[str] = None,
@@ -156,6 +226,8 @@ class MQTTNetcat:
         :param chunk_size: Chunk size for data transmission
         :param max_pending: Max pending acknowledgments before throttling
         :param qos0_delay: Delay between QoS 0 sends in milliseconds
+        :param compression_type: Compression algorithm to use (0 = none, 1 = deflate)
+        :param compression_level: Compression level (1-9, higher = more compression)
         :param verbose: Enable verbose logging
         :param quiet: Reduce logging to warnings and errors only
         :param log_file: File to write logs to
@@ -171,6 +243,8 @@ class MQTTNetcat:
         self.chunk_size = chunk_size
         self.max_pending = max_pending
         self.qos0_delay = qos0_delay
+        self.compression_type = compression_type  # Added
+        self.compression_level = compression_level  # Added
         self.verbose = verbose
         self.quiet = quiet
         self.log_file = log_file
@@ -190,6 +264,7 @@ class MQTTNetcat:
             "qos0_delay": self.qos0_delay_seconds,
             "logger": self.logger,
             "encryptor": None,
+            "compressor": Compressor(COMPRESSION_NONE),  # Placeholder
         }
         self.client = None
         self.receive_queue = queue.Queue()
@@ -200,6 +275,31 @@ class MQTTNetcat:
         # Process profile input
         self._process_profile_input()
         self._setup_encryption()
+        self._setup_compression()  # Added
+
+    def _setup_compression(self):
+        """Set up compression based on profile or arguments"""
+        # Priority: 1. Profile setting 2. Argument
+        compression_type = self.compression_type
+        compression_level = self.compression_level
+
+        if self.profile:
+            compression_type = self.profile.get("compression_type", compression_type)
+            compression_level = self.profile.get("compression_level", compression_level)
+
+        # Validate compression level
+        if compression_level < 0 or compression_level > 9:
+            self.logger.warning(f"Invalid compression level {compression_level}, using default 6")
+            compression_level = 6
+
+        # Create compressor instance
+        self.userdata["compressor"] = Compressor(compression_type, compression_level)
+
+        if compression_type != COMPRESSION_NONE:
+            self.logger.info(
+                f"Compression enabled: {COMPRESSION_NAMES.get(compression_type, 'unknown')} "
+                f"(level {compression_level})"
+            )
 
     def _setup_logging(self) -> logging.Logger:
         """Configure logging system with proper levels"""
@@ -383,12 +483,24 @@ class MQTTNetcat:
 
         try:
             payload = msg.payload
+            compressor = userdata["compressor"]
+            encryptor = userdata.get("encryptor")
 
             # Decrypt if encryption is enabled
-            encryptor = self.userdata.get("encryptor")
             if encryptor:
                 payload = encryptor.decrypt(payload, msg.topic.encode())
                 self.logger.debug("Message decrypted successfully")
+
+            # Decompress if compression is enabled
+            try:
+                decompressed = compressor.decompress(payload)
+                if len(decompressed) != len(payload):
+                    self.logger.debug(
+                        f"Decompressed {len(payload)} bytes to {len(decompressed)} bytes"
+                    )
+                payload = decompressed
+            except Exception as e:
+                self.logger.error(f"Decompression failed: {str(e)}")
 
             # Deliver data to either callback or queue
             if self.receive_callback:
@@ -502,6 +614,7 @@ class MQTTNetcat:
 
         topic = self.topics["publish"]
         encryptor = self.userdata.get("encryptor")
+        compressor = self.userdata["compressor"]
 
         action = "Retrying" if retry else "Sending"
         self.logger.debug(
@@ -510,6 +623,17 @@ class MQTTNetcat:
         )
 
         try:
+            # Compress data if compression is enabled
+            original_size = len(data)
+            try:
+                data = compressor.compress(data)
+            except Exception as e:
+                self.logger.error(f"Compression failed: {str(e)}")
+                # Continue with uncompressed data
+
+            if len(data) != original_size:
+                self.logger.debug(f"Compressed {original_size} bytes to {len(data)} bytes")
+
             # Encrypt data if encryption is enabled
             if encryptor:
                 data = encryptor.encrypt(data, topic.encode())
@@ -570,6 +694,9 @@ class MQTTNetcat:
         self.logger.debug(f"Chunk size: {self.chunk_size} bytes")
         self.logger.debug(f"Max pending: {self.userdata['max_pending']}")
         self.logger.debug(f"QoS 0 delay: {self.userdata['qos0_delay']*1000:.1f}ms")
+        self.logger.debug(
+            f"Compression: {COMPRESSION_NAMES.get(self.userdata['compressor'].compression_type, 'none')}"
+        )
 
         try:
             while self.running and not self.immediate_shutdown:
@@ -698,6 +825,22 @@ def main():
         help=f"Delay between QoS 0 sends in milliseconds (default: {DEFAULTS['QOS0_DELAY_MS']} ms)",
     )
 
+    # Compression parameters
+    comp_group = parser.add_argument_group("Compression Parameters")
+    comp_group.add_argument(
+        "--compress",
+        choices=list(COMPRESSION_TYPES.keys()),
+        default="none",
+        help="Compression algorithm to use (default: none)",
+    )
+    comp_group.add_argument(
+        "--compression-level",
+        type=int,
+        choices=range(0, 10),
+        default=6,
+        help="Compression level (1-9, higher=more compression, default: 6)",
+    )
+
     # Logging control
     log_group = parser.add_argument_group("Logging Control")
     log_group.add_argument(
@@ -709,6 +852,9 @@ def main():
     log_group.add_argument("--log-file", help="File to write logs to (default: stderr)")
 
     args = parser.parse_args()
+
+    # Convert compression name to type
+    compression_type = COMPRESSION_TYPES.get(args.compress, COMPRESSION_NONE)
 
     # Create and run MQTTNetcat instance in CLI mode
     try:
@@ -722,6 +868,8 @@ def main():
             chunk_size=args.chunk_size,
             max_pending=args.max_pending,
             qos0_delay=args.qos0_delay,
+            compression_type=compression_type,  # Added
+            compression_level=args.compression_level,  # Added
             verbose=args.verbose,
             quiet=args.quiet,
             log_file=args.log_file,
