@@ -715,7 +715,6 @@ def main():
         nc = MQTTNetcat(
             mode=args.mode,
             prefix=args.prefix,
-            profile=args.profile,
             profile_name=args.profile_name,
             profiles_file=args.profiles_file,
             qos=args.qos,
