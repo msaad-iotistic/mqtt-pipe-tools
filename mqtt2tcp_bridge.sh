@@ -22,6 +22,6 @@ mkfifo "$p1" "$p2"
 trap "rm -f $p1 $p2; kill 0" EXIT
 
 # Bridge processes
-cat "$p2" | python3 mqtt_pipe.py listen "$topic" "$config" "$profile" > "$p1" &
+cat "$p2" | python3 mqttcat.py listen "$topic" "$config" "$profile" -v > "$p1" &
 cat "$p1" | nc "$host" "$port" > "$p2" &
 wait
