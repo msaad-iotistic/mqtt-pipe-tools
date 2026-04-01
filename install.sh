@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# install.sh - Install mqtt-wormhole and mqttcat globally
+# install.sh - Install mqtt-wormhole and mqtt-cat globally
 #
 # Usage:
 #   ./install.sh           # Install for current user
@@ -21,8 +21,8 @@ NC='\033[0m' # No Color
 
 # Script locations
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORMHOLE_SCRIPT="$SCRIPT_DIR/mqtt-wormhole.py"
-MQTTCAT_SCRIPT="$SCRIPT_DIR/mqttcat.py"
+WORMHOLE_SCRIPT="$SCRIPT_DIR/mqtt_wormhole.py"
+MQTTCAT_SCRIPT="$SCRIPT_DIR/mqtt_cat.py"
 REQUIREMENTS="$SCRIPT_DIR/requirements.txt"
 VENV_DIR="$SCRIPT_DIR/venv"
 
@@ -31,7 +31,7 @@ SYSTEM_PYTHON="/opt/iotistic-mnvr/mnvrenv/bin/python"
 
 # Target command names
 WORMHOLE_CMD="mqtt-wormhole"
-MQTTCAT_CMD="mqttcat"
+MQTTCAT_CMD="mqtt-cat"
 
 # Will be set during install
 PYTHON_BIN=""
@@ -180,19 +180,19 @@ get_shell_rc() {
 check_scripts_exist() {
     local missing=0
     if [ ! -f "$WORMHOLE_SCRIPT" ]; then
-        print_error "mqtt-wormhole.py not found at: $WORMHOLE_SCRIPT"
+        print_error "mqtt_wormhole.py not found at: $WORMHOLE_SCRIPT"
         missing=1
     fi
     if [ ! -f "$MQTTCAT_SCRIPT" ]; then
-        print_error "mqttcat.py not found at: $MQTTCAT_SCRIPT"
+        print_error "mqtt_cat.py not found at: $MQTTCAT_SCRIPT"
         missing=1
     fi
     return $missing
 }
 
 make_executable() {
-    chmod +x "$WORMHOLE_SCRIPT" 2>/dev/null && print_success "Made mqtt-wormhole.py executable"
-    chmod +x "$MQTTCAT_SCRIPT" 2>/dev/null && print_success "Made mqttcat.py executable"
+    chmod +x "$WORMHOLE_SCRIPT" 2>/dev/null && print_success "Made mqtt_wormhole.py executable"
+    chmod +x "$MQTTCAT_SCRIPT" 2>/dev/null && print_success "Made mqtt_cat.py executable"
 }
 
 create_wrapper() {
@@ -247,9 +247,9 @@ verify_installation() {
     fi
 
     if command -v "$MQTTCAT_CMD" &>/dev/null; then
-        print_success "mqttcat installed at: $(command -v "$MQTTCAT_CMD")"
+        print_success "mqtt-cat installed at: $(command -v "$MQTTCAT_CMD")"
     else
-        print_warning "mqttcat not found in PATH (may need to restart shell)"
+        print_warning "mqtt-cat not found in PATH (may need to restart shell)"
         success=1
     fi
 
@@ -318,7 +318,7 @@ do_install() {
     echo "You can now use:"
     echo -e "  ${BOLD}mqtt-wormhole myfile.pdf${NC}              # Send a file"
     echo -e "  ${BOLD}mqtt-wormhole --code 7-cosmic-dolphin${NC} # Receive a file"
-    echo -e "  ${BOLD}mqttcat listen prefix profiles.json profile${NC}"
+    echo -e "  ${BOLD}mqtt-cat listen prefix profiles.json profile${NC}"
     echo ""
     echo "Run 'mqtt-wormhole --help' for usage information."
     echo ""
@@ -396,7 +396,7 @@ do_uninstall() {
 show_help() {
     echo "Usage: $0 [OPTIONS]"
     echo ""
-    echo "Install mqtt-wormhole and mqttcat commands globally."
+    echo "Install mqtt-wormhole and mqtt-cat commands globally."
     echo ""
     echo "Options:"
     echo "  --uninstall    Remove installed commands"

@@ -23,5 +23,5 @@ trap "rm -f $p1 $p2; kill 0" EXIT
 
 # Bridge processes
 cat "$p2" | nc -klv "$host" "$port" > "$p1" &
-cat "$p1" | python3 mqttcat.py connect "$topic" "$config" "$profile" -v > "$p2" &
+cat "$p1" | python3 mqtt_cat.py connect "$topic" "$config" "$profile" -v > "$p2" &
 wait

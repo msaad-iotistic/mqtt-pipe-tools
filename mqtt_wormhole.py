@@ -27,9 +27,9 @@ except ImportError:
     tqdm = None
 
 
-# Add parent directory to path so we can import mqttcat
+# Add parent directory to path so we can import mqtt_cat
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mqttcat import MQTTNetcat, COMPRESSION_TYPES, COMPRESSION_NONE
+from mqtt_cat import MQTTNetcat, COMPRESSION_TYPES, COMPRESSION_NONE
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 WORDLIST_FILE = os.path.join(SCRIPT_DIR, "wordlist.txt")

@@ -3,16 +3,16 @@
 # quick-install.sh - One-line installer for mqtt-pipe-tools
 #
 # Usage:
-#   curl -sSL https://raw.githubusercontent.com/Mohammad-Saad-Acacus/mqtt-pipe-tools/main/scripts/quick-install.sh | bash
+#   curl -sSL https://raw.githubusercontent.com/msaad-iotistic/mqtt-pipe-tools/main/scripts/quick-install.sh | bash
 #
 # Custom install location:
-#   MQTT_TOOLS_DIR=~/tools/mqtt-pipe-tools bash <(curl -sSL ...)
+#   MQTT_TOOLS_DIR=~/tools/mqtt-pipe-tools bash <(curl -sSL https://raw.githubusercontent.com/msaad-iotistic/mqtt-pipe-tools/main/scripts/quick-install.sh) | bash
 #
 
 set -e
 
 INSTALL_DIR="${MQTT_TOOLS_DIR:-$HOME/.local/share/mqtt-pipe-tools}"
-REPO_URL="https://github.com/Mohammad-Saad-Acacus/mqtt-pipe-tools.git"
+REPO_URL="https://github.com/msaad-iotistic/mqtt-pipe-tools.git"
 
 # Colors
 RED='\033[0;31m'
@@ -55,17 +55,17 @@ check_existing_install() {
             install_location=$(readlink -f "$cmd_path" 2>/dev/null || readlink "$cmd_path")
         elif [ -f "$cmd_path" ]; then
             # It's a wrapper script - extract the path from exec line
-            # Wrapper format: exec "/path/to/python" "/path/to/mqtt-wormhole.py" "$@"
-            install_location=$(grep -oE '"/[^"]+/mqtt-wormhole\.py"' "$cmd_path" 2>/dev/null | tr -d '"' | head -1 || echo "")
+            # Wrapper format: exec "/path/to/python" "/path/to/mqtt_wormhole.py" "$@"
+            install_location=$(grep -oE '"/[^" ]+/mqtt_wormhole\.py"' "$cmd_path" 2>/dev/null | tr -d '"' | head -1 || echo "")
             if [ -z "$install_location" ]; then
                 # Try without quotes
-                install_location=$(grep -oE '/[^ ]+/mqtt-wormhole\.py' "$cmd_path" 2>/dev/null | head -1 || echo "")
+                install_location=$(grep -oE '/[^ ]+/mqtt_wormhole\.py' "$cmd_path" 2>/dev/null | head -1 || echo "")
             fi
         fi
         
         if [ -n "$install_location" ]; then
             # Get the directory containing the scripts
-            if [[ "$install_location" == *"/mqtt-wormhole.py" ]]; then
+            if [[ "$install_location" == *"/mqtt_wormhole.py" ]]; then
                 install_location=$(dirname "$install_location")
             fi
             echo "$install_location"

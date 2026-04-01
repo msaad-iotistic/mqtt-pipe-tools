@@ -6,7 +6,7 @@ Tools for piping data through MQTT brokers, including a Magic Wormhole-like file
 
 ### One-Line Install
 ```bash
-curl -sSL https://raw.githubusercontent.com/Mohammad-Saad-Acacus/mqtt-pipe-tools/main/scripts/quick-install.sh | bash
+curl -sSL https://raw.githubusercontent.com/msaad-iotistic/mqtt-pipe-tools/main/scripts/quick-install.sh | bash
 ```
 
 This will clone to `~/.local/share/mqtt-pipe-tools`, install dependencies, and create the commands.
@@ -25,17 +25,17 @@ mqtt-wormhole --host broker.emqx.io --code 42-cosmic-dolphin
 
 ### One-Line Install (Recommended)
 ```bash
-curl -sSL https://raw.githubusercontent.com/Mohammad-Saad-Acacus/mqtt-pipe-tools/main/scripts/quick-install.sh | bash
+curl -sSL https://raw.githubusercontent.com/msaad-iotistic/mqtt-pipe-tools/main/scripts/quick-install.sh | bash
 ```
 
 **Custom location:**
 ```bash
-MQTT_TOOLS_DIR=~/tools/mqtt-pipe-tools bash <(curl -sSL https://raw.githubusercontent.com/Mohammad-Saad-Acacus/mqtt-pipe-tools/main/scripts/quick-install.sh)
+MQTT_TOOLS_DIR=~/tools/mqtt-pipe-tools bash <(curl -sSL https://raw.githubusercontent.com/msaad-iotistic/mqtt-pipe-tools/main/scripts/quick-install.sh)
 ```
 
 ### Manual Install
 ```bash
-git clone https://github.com/Mohammad-Saad-Acacus/mqtt-pipe-tools.git
+git clone https://github.com/msaad-iotistic/mqtt-pipe-tools.git
 cd mqtt-pipe-tools
 ./install.sh              # Install for current user
 sudo ./install.sh         # Install system-wide
@@ -45,7 +45,7 @@ sudo ./install.sh         # Install system-wide
 The installer will:
 - Detect or create a Python virtual environment
 - Install dependencies automatically
-- Create `mqtt-wormhole` and `mqttcat` commands
+- Create `mqtt-wormhole` and `mqtt-cat` commands
 
 ### Dependencies Only
 ```bash
@@ -62,7 +62,7 @@ Magic Wormhole-like file transfer over MQTT. Send files between machines using m
 - **Multi-file/directory** support (auto-tarballed)
 - **SHA256 checksums** verified on receive
 - **Compression** enabled by default (deflate)
-- **Encryption** support via mqttcat
+- **Encryption** support via mqtt-cat
 
 ### Usage
 
@@ -116,26 +116,26 @@ cp .env.example .env
 | `MQTT_ENCRYPTION_KEY` | End-to-end encryption key |
 | `MQTT_COMPRESSION` | Compression (deflate/none) |
 
-## mqttcat
+## mqtt-cat
 
 Netcat-like MQTT client for piping data through brokers.
 
 ### Usage
 ```bash
 # Listen mode (subscribe)
-mqttcat listen my/topic profiles.json profile_name
+mqtt-cat listen my/topic profiles.json profile_name
 
 # Connect mode (publish stdin)
-echo "Hello" | mqttcat connect my/topic profiles.json profile_name
+echo "Hello" | mqtt-cat connect my/topic profiles.json profile_name
 ```
 
 ### Binary Data Example
 ```bash
 # Send image
-cat image.jpg | mqttcat connect images/topic profiles.json test
+cat image.jpg | mqtt-cat connect images/topic profiles.json test
 
 # Receive image
-mqttcat listen images/topic profiles.json test > received.jpg
+mqtt-cat listen images/topic profiles.json test > received.jpg
 ```
 
 ## Features
