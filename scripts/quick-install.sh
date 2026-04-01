@@ -55,12 +55,8 @@ check_existing_install() {
             install_location=$(readlink -f "$cmd_path" 2>/dev/null || readlink "$cmd_path")
         elif [ -f "$cmd_path" ]; then
             # It's a wrapper script - extract the path from exec line
-            # Wrapper format: exec "/path/to/python" "/path/to/mqtt_wormhole.py" "$@"
-            install_location=$(grep -oE '"/[^" ]+/mqtt_wormhole\.py"' "$cmd_path" 2>/dev/null | tr -d '"' | head -1 || echo "")
-            if [ -z "$install_location" ]; then
-                # Try without quotes
-                install_location=$(grep -oE '/[^ ]+/mqtt_wormhole\.py' "$cmd_path" 2>/dev/null | head -1 || echo "")
-            fi
+            # Wrapper format: exec /path/to/python /path/to/mqtt_wormhole.py "$@"
+            install_location=$(grep -oE '/[^ ]+/mqtt_wormhole\.py' "$cmd_path" 2>/dev/null | head -1 || echo "")
         fi
         
         if [ -n "$install_location" ]; then
@@ -129,30 +125,46 @@ else
     print_success "Repository cloned"
 fi
 
-# Remove broken symlinks from previous versions
+# Remove broken symlinks and old wrappers from previous versions
 remove_old_links() {
     local removed=0
     local bin_locations=("$HOME/.local/bin" "$HOME/bin" "/usr/local/bin")
     
-    print_info "Checking for broken mqtt-pipe-tools symlinks..."
+    print_info "Checking for old mqtt-pipe-tools links and wrappers..."
     
     for bin_dir in "${bin_locations[@]}"; do
         if [ ! -d "$bin_dir" ]; then
             continue
         fi
         
-        # Check all items in bin directory for broken symlinks
+        # Check all items in bin directory
         for item in "$bin_dir"/*; do
-            # Check if it's a broken symlink (exists as link but target doesn't)
+            if [ ! -e "$item" ] && [ ! -L "$item" ]; then
+                continue
+            fi
+            
+            # Check if it's a broken symlink pointing to mqtt-pipe-tools
             if [ -L "$item" ] && [ ! -e "$item" ]; then
-                # Check if the symlink target was related to mqtt-pipe-tools
                 local target=$(readlink "$item" 2>/dev/null || echo "")
                 if [[ "$target" == *"mqtt-pipe-tools"* ]]; then
                     if rm -f "$item" 2>/dev/null; then
-                        print_success "Removed broken mqtt-pipe-tools symlink: $(basename "$item")"
+                        print_success "Removed broken symlink: $(basename "$item")"
                         ((removed++))
                     else
                         print_warning "Could not remove broken symlink: $(basename "$item") (may need sudo)"
+                    fi
+                fi
+            fi
+            
+            # Check if it's a wrapper script pointing to mqtt-pipe-tools
+            if [ -f "$item" ] && grep -q "mqtt-pipe-tools" "$item" 2>/dev/null; then
+                # Check if it points to old filenames (mqtt-wormhole.py or mqttcat.py)
+                if grep -qE "mqtt-wormhole\.py|mqttcat\.py" "$item" 2>/dev/null; then
+                    if rm -f "$item" 2>/dev/null; then
+                        print_success "Removed old wrapper: $(basename "$item")"
+                        ((removed++))
+                    else
+                        print_warning "Could not remove old wrapper: $(basename "$item") (may need sudo)"
                     fi
                 fi
             fi
@@ -160,9 +172,9 @@ remove_old_links() {
     done
     
     if [ $removed -gt 0 ]; then
-        print_success "Cleaned up $removed mqtt-pipe-tools symlink(s)"
+        print_success "Cleaned up $removed old link(s)/wrapper(s)"
     else
-        print_success "No broken mqtt-pipe-tools symlinks found"
+        print_success "No old links or wrappers found"
     fi
 }
 
