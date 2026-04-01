@@ -9,6 +9,7 @@ import argparse
 import hashlib
 import io
 import json
+import logging
 import os
 import random
 import signal
@@ -16,6 +17,7 @@ import sys
 import tarfile
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -34,8 +36,12 @@ WORDLIST_FILE = os.path.join(SCRIPT_DIR, "wordlist.txt")
 ENV_FILE = os.path.join(SCRIPT_DIR, ".env")
 DEFAULT_PROFILES_FILE = "/opt/config/mqtt_profiles.json"
 DEFAULT_PROFILE_NAME = "iotistic"
+DEFAULT_LOG_FILE = os.path.join(SCRIPT_DIR, "mqtt-wormhole.log")
 PROTOCOL_VERSION = "1.0"
 TOPIC_BASE = "wormhole"
+
+# Logger will be configured in main
+logger = logging.getLogger("mqtt-wormhole")
 
 # Framing: each MQTT message is prefixed with a 1-byte type tag
 TAG_CONTROL = 0x00  # JSON control message
@@ -475,11 +481,13 @@ def do_send(args, env_config: dict):
     transfer_config = get_transfer_config(args, env_config)
 
     code = args.code or generate_code()
+    logger.info(f"Starting send mode with code: {code}")
 
     # Collect file metadata and prepare tarball if needed
     metadata, tar_path = collect_file_metadata(args.files)
     total_size = metadata["total_size"]
     send_path = tar_path if tar_path else str(Path(args.files[0]).resolve())
+    logger.info(f"Prepared files: {metadata['file_count']} file(s), total size: {human_size(total_size)}")
 
     print(file=sys.stderr)
     print(f"Your pairing code is: \033[1;36m{code}\033[0m", file=sys.stderr)
@@ -489,6 +497,7 @@ def do_send(args, env_config: dict):
     print(file=sys.stderr)
 
     # Sender uses "connect" mode (publishes to prefix/listen, subscribes to prefix/connect)
+    logger.info(f"Connecting to broker: {profile.get('host', 'default')}:{profile.get('port', 1883)}")
     client = create_client("connect", code, profile, enc_config, transfer_config, verbose=args.verbose)
 
     cleanup_done = False
@@ -519,14 +528,17 @@ def do_send(args, env_config: dict):
 
         # Wait for receiver READY
         print("Waiting for receiver to connect...", file=sys.stderr)
+        logger.info("Waiting for receiver READY message")
         while True:
             msg = recv_control(client, timeout=3600)
             if msg and msg.get("type") == MSG_READY:
                 print("Receiver connected!", file=sys.stderr)
+                logger.info("Receiver connected and ready")
                 break
 
         # Send metadata
         print("Sending file info...", file=sys.stderr)
+        logger.info(f"Sending metadata: {metadata['files'][0]['name']}")
         send_control(client, MSG_METADATA, metadata)
 
         # Wait for ACK (receiver accepted)
@@ -547,6 +559,7 @@ def do_send(args, env_config: dict):
         file_info = metadata["files"][0]
         desc = f"Sending {file_info['name']}"
         chunk_size = transfer_config["chunk_size"]
+        logger.info(f"Starting file transfer: {file_info['name']} ({human_size(total_size)})")
 
         with open(send_path, "rb") as f, make_progress_bar(total_size, desc) as pbar:
             while True:
@@ -560,6 +573,7 @@ def do_send(args, env_config: dict):
                     time.sleep(0.001)
 
         # Signal transfer complete
+        logger.info("File transfer complete, sending DONE message")
         time.sleep(0.5)
         send_control(client, MSG_DONE)
 
@@ -568,15 +582,20 @@ def do_send(args, env_config: dict):
         if msg and msg.get("type") == MSG_ACK:
             if msg.get("checksum_ok"):
                 print("Transfer complete! Checksum verified.", file=sys.stderr)
+                logger.info("Transfer successful, checksum verified by receiver")
             else:
                 print("Transfer complete! (checksum mismatch on receiver)", file=sys.stderr)
+                logger.warning("Transfer complete but checksum mismatch on receiver")
         else:
             print("Transfer sent (no final confirmation from receiver).", file=sys.stderr)
+            logger.warning("No final confirmation received from receiver")
 
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
+        logger.info("Send interrupted by user")
     except Exception as e:
         print(f"\nError: {e}", file=sys.stderr)
+        logger.error(f"Send failed with error: {e}", exc_info=True)
         sys.exit(1)
     finally:
         cleanup()
@@ -601,10 +620,13 @@ def do_receive(args, env_config: dict):
         print("Error: No pairing code provided.", file=sys.stderr)
         sys.exit(1)
 
+    logger.info(f"Starting receive mode with code: {code}")
     output_dir = Path(args.output).resolve() if args.output else Path.cwd()
     output_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Output directory: {output_dir}")
 
     print(f"Connecting to broker...", file=sys.stderr)
+    logger.info(f"Connecting to broker: {profile.get('host', 'default')}:{profile.get('port', 1883)}")
 
     # Receiver uses "listen" mode (publishes to prefix/connect, subscribes to prefix/listen)
     client = create_client("listen", code, profile, enc_config, transfer_config, verbose=args.verbose)
@@ -635,6 +657,7 @@ def do_receive(args, env_config: dict):
 
         # Send READY and wait for metadata
         print("Waiting for sender...", file=sys.stderr)
+        logger.info("Sending READY messages, waiting for metadata")
         metadata = None
         last_ready = 0
 
@@ -648,11 +671,13 @@ def do_receive(args, env_config: dict):
             if tag == TAG_CONTROL and isinstance(body, dict):
                 if body.get("type") == MSG_METADATA:
                     metadata = body
+                    logger.info(f"Received metadata: {metadata['files'][0]['name']}")
 
         # Display file info
         file_info = metadata["files"][0]
         total_size = metadata["total_size"]
         transfer_type = metadata.get("transfer_type", "single")
+        logger.info(f"Transfer type: {transfer_type}, size: {human_size(total_size)}")
 
         print(file=sys.stderr)
         if transfer_type == "directory":
@@ -672,6 +697,7 @@ def do_receive(args, env_config: dict):
 
         # Accept transfer
         send_control(client, MSG_ACK)
+        logger.info("Sent ACK, starting data reception")
 
         # Receive data chunks
         desc = f"Receiving {file_info['name']}"
@@ -719,10 +745,12 @@ def do_receive(args, env_config: dict):
 
         if checksum_ok:
             print("Checksum verified!", file=sys.stderr)
+            logger.info(f"Checksum verified: {actual_checksum}")
         else:
             print("Warning: Checksum mismatch!", file=sys.stderr)
             print(f"  Expected: {expected_checksum}", file=sys.stderr)
             print(f"  Got:      {actual_checksum}", file=sys.stderr)
+            logger.warning(f"Checksum mismatch! Expected: {expected_checksum}, Got: {actual_checksum}")
 
         # Save file
         out_file = output_dir / file_info["name"]
@@ -756,11 +784,14 @@ def do_receive(args, env_config: dict):
         # Send final ACK with checksum result
         send_control(client, MSG_ACK, {"checksum_ok": checksum_ok})
         print("Transfer complete!", file=sys.stderr)
+        logger.info(f"Transfer complete, saved to: {out_file}")
 
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
+        logger.info("Receive interrupted by user")
     except Exception as e:
         print(f"\nError: {e}", file=sys.stderr)
+        logger.error(f"Receive failed with error: {e}", exc_info=True)
         sys.exit(1)
     finally:
         cleanup()
@@ -775,7 +806,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "Examples:\n"
             "  Send:    mqtt-wormhole myfile.pdf\n"
-            "  Receive: mqtt-wormhole\n"
+            "  Send:    mqtt-wormhole --code mycode myfile.pdf  # fixed code for scripts\n"
             "  Receive: mqtt-wormhole --code 7-guitar-nebula\n"
             "  Send:    mqtt-wormhole --host broker.example.com myfile.pdf\n"
         ),
@@ -794,7 +825,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mode_group.add_argument(
         "--code", "-c", type=str, default=None,
-        help="Pairing code (generated automatically for send, required/prompted for receive)",
+        help="Pairing code (auto-generated if omitted for send, required for receive)",
     )
     mode_group.add_argument(
         "--output", "-o", type=str, default=None,
@@ -821,13 +852,47 @@ def build_parser() -> argparse.ArgumentParser:
     xfer_group.add_argument("--compress", choices=list(COMPRESSION_TYPES.keys()), default=None, help="Compression")
 
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
+    parser.add_argument("--log-file", type=str, default=None, help=f"Log file path (default: {DEFAULT_LOG_FILE})")
 
     return parser
+
+
+def setup_logging(log_file: str, verbose: bool = False):
+    """Configure logging to file and optionally console."""
+    log_level = logging.DEBUG if verbose else logging.INFO
+    
+    # Create formatter
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # File handler
+    file_handler = logging.FileHandler(log_file, mode='a')
+    file_handler.setLevel(log_level)
+    file_handler.setFormatter(formatter)
+    
+    # Configure logger
+    logger.setLevel(log_level)
+    logger.addHandler(file_handler)
+    
+    # Add console handler if verbose
+    if verbose:
+        console_handler = logging.StreamHandler(sys.stderr)
+        console_handler.setLevel(logging.DEBUG)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
 
 
 def main():
     parser = build_parser()
     args = parser.parse_args()
+
+    # Setup logging
+    log_file = args.log_file if args.log_file else DEFAULT_LOG_FILE
+    setup_logging(log_file, args.verbose)
+    logger.info("="*60)
+    logger.info(f"mqtt-wormhole started (version {PROTOCOL_VERSION})")
 
     env_config = load_env_config()
 

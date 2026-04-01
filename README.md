@@ -61,6 +61,9 @@ mqtt-wormhole ./my-folder/
 # Send multiple files
 mqtt-wormhole file1.txt file2.jpg
 
+# Send with a fixed code (useful for scripts/non-interactive shells)
+mqtt-wormhole --code mycode myfile.pdf
+
 # Receive (prompts for code)
 mqtt-wormhole
 
