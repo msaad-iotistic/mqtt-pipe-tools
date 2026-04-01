@@ -24,10 +24,6 @@ try:
 except ImportError:
     tqdm = None
 
-try:
-    from dotenv import dotenv_values
-except ImportError:
-    dotenv_values = None
 
 # Add parent directory to path so we can import mqttcat
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -82,51 +78,57 @@ def generate_code(num_words: int = 2) -> str:
     return f"{number}-{'-'.join(chosen)}"
 
 
+def parse_env_file(filepath: str) -> dict:
+    """Parse a .env file into a dict of key=value pairs."""
+    env = {}
+    try:
+        with open(filepath, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                key = key.strip()
+                val = val.strip()
+                # Strip surrounding quotes
+                if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                    val = val[1:-1]
+                env[key] = val
+    except Exception:
+        pass
+    return env
+
+
 def load_env_config() -> dict:
     """Load configuration from .env file."""
     config = {}
-    env_file = ENV_FILE
+    if not os.path.exists(ENV_FILE):
+        return config
 
-    if dotenv_values and os.path.exists(env_file):
-        env = dotenv_values(env_file)
-        mapping = {
-            "MQTT_HOST": "host",
-            "MQTT_PORT": "port",
-            "MQTT_USERNAME": "username",
-            "MQTT_PASSWORD": "password",
-            "MQTT_TLS": "tls",
-            "MQTT_INSECURE": "insecure",
-            "MQTT_CA_CERTS": "ca_certs",
-            "MQTT_CERTFILE": "certfile",
-            "MQTT_KEYFILE": "keyfile",
-            "MQTT_ENCRYPTION_KEY": "encryption_key",
-            "MQTT_ENCRYPTION_SALT": "encryption_salt",
-            "MQTT_ENCRYPTION_ITERATIONS": "encryption_iterations",
-            "MQTT_QOS": "qos",
-            "MQTT_CHUNK_SIZE": "chunk_size",
-            "MQTT_COMPRESSION": "compression",
-        }
-        for env_key, conf_key in mapping.items():
-            val = env.get(env_key)
-            if val is not None and val != "":
-                config[conf_key] = val
-    elif os.path.exists(env_file):
-        # Manual .env parsing if python-dotenv not installed
-        try:
-            with open(env_file, "r") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    if "=" in line:
-                        key, val = line.split("=", 1)
-                        key = key.strip()
-                        val = val.strip().strip('"').strip("'")
-                        if key.startswith("MQTT_") and val:
-                            short_key = key[5:].lower()
-                            config[short_key] = val
-        except Exception:
-            pass
+    env = parse_env_file(ENV_FILE)
+    mapping = {
+        "MQTT_HOST": "host",
+        "MQTT_PORT": "port",
+        "MQTT_USERNAME": "username",
+        "MQTT_PASSWORD": "password",
+        "MQTT_TLS": "tls",
+        "MQTT_INSECURE": "insecure",
+        "MQTT_CA_CERTS": "ca_certs",
+        "MQTT_CERTFILE": "certfile",
+        "MQTT_KEYFILE": "keyfile",
+        "MQTT_ENCRYPTION_KEY": "encryption_key",
+        "MQTT_ENCRYPTION_SALT": "encryption_salt",
+        "MQTT_ENCRYPTION_ITERATIONS": "encryption_iterations",
+        "MQTT_QOS": "qos",
+        "MQTT_CHUNK_SIZE": "chunk_size",
+        "MQTT_COMPRESSION": "compression",
+    }
+    for env_key, conf_key in mapping.items():
+        val = env.get(env_key)
+        if val is not None and val != "":
+            config[conf_key] = val
     return config
 
 
