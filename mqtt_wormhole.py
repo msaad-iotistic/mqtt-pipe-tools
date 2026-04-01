@@ -38,7 +38,7 @@ ENV_FILE = os.path.join(SCRIPT_DIR, ".env")
 DEFAULT_PROFILES_FILE = "/opt/config/mqtt_profiles.json"
 DEFAULT_PROFILE_NAME = "iotistic"
 DEFAULT_LOG_FILE = os.path.join(SCRIPT_DIR, "mqtt-wormhole.log")
-PROTOCOL_VERSION = "1.0"
+PROTOCOL_VERSION = "2.0"
 TOPIC_BASE = "wormhole"
 
 # Logger will be configured in main
@@ -50,6 +50,10 @@ TAG_DATA = 0x01     # Raw file data
 
 # Control message types
 MSG_READY = "ready"
+MSG_CHALLENGE = "challenge"
+MSG_CHALLENGE_RESPONSE = "challenge_response"
+MSG_ACCEPTED = "accepted"
+MSG_REJECTED = "rejected"
 MSG_METADATA = "metadata"
 MSG_ACK = "ack"
 MSG_DONE = "done"
@@ -540,73 +544,6 @@ def create_client(mode: str, code: str, profile: dict, enc_config: dict,
     )
 
 
-def recv_message_with_retry(client: MQTTNetcat, enc_config: dict, code: str, timeout: float = 60):
-    """
-    Receive message with ±1 time window tolerance for auto-encryption.
-    For auto-encryption, tries to decrypt with current, previous, and next time windows.
-    Returns (tag, body, successful_offset) or (None, None, None) on timeout/failure.
-    """
-    if not enc_config.get("auto_encrypt"):
-        # Not using auto-encryption, use normal receive
-        tag, body = recv_message(client, timeout)
-        return tag, body, 0
-    
-    # Receive the raw encrypted message first
-    raw = client.receive(timeout=timeout)
-    if raw is None or len(raw) == 0:
-        return None, None, None
-    
-    tag = raw[0]
-    encrypted_body = raw[1:]
-    
-    # For control messages, try decrypting with ±1 time windows
-    if tag == TAG_CONTROL:
-        secret = enc_config.get("secret")
-        key_window = enc_config.get("key_window", 1000)
-        iterations = enc_config.get("encryption_iterations", 210000)
-        
-        # Try current window first, then -1, then +1
-        for offset in [0, -1, 1]:
-            try:
-                # Derive key for this time window
-                derived_key, derived_salt = derive_time_based_key(secret, code, key_window, offset)
-                
-                # Create encryptor with this window's key
-                salt_bytes = base64.b64decode(derived_salt) if derived_salt else b""
-                from mqtt_cat import Encryptor
-                encryptor = Encryptor(password=derived_key, salt=salt_bytes, iterations=iterations)
-                
-                # Try to decrypt
-                # AAD (Additional Authenticated Data) is the topic, same as in mqtt_cat
-                aad = f"{TOPIC_BASE}/{code}".encode()
-                decrypted = encryptor.decrypt(encrypted_body, aad)
-                
-                # Try to parse as JSON
-                body = json.loads(decrypted.decode())
-                
-                if offset != 0:
-                    logger.info(f"Successfully decrypted with time window offset {offset}")
-                    # Update client's encryptor to use the successful key
-                    client.userdata["encryptor"] = encryptor
-                
-                return TAG_CONTROL, body, offset
-                
-            except Exception as e:
-                # Decryption/parsing failed with this window, try next
-                logger.debug(f"Decryption failed with offset {offset}: {e}")
-                continue
-        
-        # All windows failed
-        logger.error("Failed to decrypt with any time window (0, -1, +1)")
-        return None, None, None
-    
-    elif tag == TAG_DATA:
-        # For data chunks, use the client's current encryptor (already set from control message)
-        return TAG_DATA, encrypted_body, 0
-    
-    return None, None, None
-
-
 # ─── SEND MODE ──────────────────────────────────────────────────────────────
 
 def do_send(args, env_config: dict):
@@ -668,6 +605,10 @@ def do_send(args, env_config: dict):
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
+    # Track authentication attempts across connection retries
+    auth_attempts = 0
+    max_attempts = 3
+    
     try:
         client.connect()
         time.sleep(0.5)
@@ -682,6 +623,97 @@ def do_send(args, env_config: dict):
                 logger.info("Receiver connected and ready")
                 break
 
+        # Challenge-response authentication
+        if enc_config.get("auto_encrypt"):
+            print("Authenticating receiver...", file=sys.stderr)
+            logger.info("Starting challenge-response authentication")
+            
+            # Generate random cleartext nonce
+            nonce = base64.b64encode(os.urandom(24)).decode('ascii')
+            logger.debug(f"Generated nonce: {nonce}")
+            
+            # Send challenge
+            send_control(client, MSG_CHALLENGE, {"nonce": nonce})
+            
+            # Wait for challenge response
+            response_msg = recv_control(client, timeout=60)
+            if response_msg is None or response_msg.get("type") != MSG_CHALLENGE_RESPONSE:
+                print("Error: No challenge response from receiver. Aborting.", file=sys.stderr)
+                logger.error("No challenge response received")
+                cleanup()
+                sys.exit(1)
+            
+            encrypted_nonce = response_msg.get("encrypted_nonce")
+            if not encrypted_nonce:
+                print("Error: Invalid challenge response. Aborting.", file=sys.stderr)
+                logger.error("Challenge response missing encrypted_nonce")
+                cleanup()
+                sys.exit(1)
+            
+            # Try to decrypt with ±1 windows and verify
+            verified = False
+            successful_offset = None
+            
+            for offset in [0, -1, 1]:
+                try:
+                    # Derive key for this window
+                    derived_key, derived_salt = derive_time_based_key(
+                        enc_config['secret'], code, enc_config['key_window'], offset
+                    )
+                    
+                    # Create encryptor
+                    salt_bytes = base64.b64decode(derived_salt)
+                    from mqtt_cat import Encryptor
+                    encryptor = Encryptor(
+                        password=derived_key,
+                        salt=salt_bytes,
+                        iterations=enc_config.get("encryption_iterations", 210000)
+                    )
+                    
+                    # Try to decrypt
+                    aad = f"{TOPIC_BASE}/{code}".encode()
+                    encrypted_bytes = base64.b64decode(encrypted_nonce)
+                    decrypted = encryptor.decrypt(encrypted_bytes, aad)
+                    decrypted_nonce = decrypted.decode('ascii')
+                    
+                    if decrypted_nonce == nonce:
+                        verified = True
+                        successful_offset = offset
+                        logger.info(f"Authentication successful with window offset {offset}")
+                        break
+                        
+                except Exception as e:
+                    logger.debug(f"Decryption failed with offset {offset}: {e}")
+                    continue
+            
+            if verified:
+                # Send ACCEPTED with window offset
+                send_control(client, MSG_ACCEPTED, {"window_offset": successful_offset})
+                print("✓ Authentication successful!", file=sys.stderr)
+            else:
+                # Authentication failed
+                auth_attempts += 1
+                attempts_remaining = max_attempts - auth_attempts
+                
+                logger.warning(f"Authentication failed. Attempts: {auth_attempts}/{max_attempts}")
+                print(f"✗ Authentication failed. Attempts remaining: {attempts_remaining}", file=sys.stderr)
+                
+                # Send REJECTED
+                send_control(client, MSG_REJECTED, {
+                    "attempts_remaining": attempts_remaining,
+                    "final": auth_attempts >= max_attempts
+                })
+                
+                cleanup()
+                
+                if auth_attempts >= max_attempts:
+                    print(f"\nMaximum authentication attempts ({max_attempts}) reached. Exiting.", file=sys.stderr)
+                    logger.error("Maximum authentication attempts reached, exiting")
+                    sys.exit(1)
+                else:
+                    print("\nReceiver can retry with correct secret.", file=sys.stderr)
+                    sys.exit(1)
+        
         # Send metadata
         print("Sending file info...", file=sys.stderr)
         logger.info(f"Sending metadata: {metadata['files'][0]['name']}")
@@ -809,30 +841,119 @@ def do_receive(args, env_config: dict):
         client.connect()
         time.sleep(0.5)
 
-        # Send READY and wait for metadata
+        # Send READY and wait for challenge or metadata
         print("Waiting for sender...", file=sys.stderr)
-        logger.info("Sending READY messages, waiting for metadata")
-        metadata = None
+        logger.info("Sending READY messages")
         last_ready = 0
-        successful_offset = None
+        challenge_received = False
+        metadata = None
 
+        # Send READY until we get a response, then wait for metadata
         while metadata is None:
             now = time.monotonic()
-            if now - last_ready >= 2:
+            if not challenge_received and now - last_ready >= 2:
                 send_control(client, MSG_READY)
                 last_ready = now
 
-            if enc_config.get("auto_encrypt"):
-                tag, body, offset = recv_message_with_retry(client, enc_config, code, timeout=2)
-                if successful_offset is None and offset is not None:
-                    successful_offset = offset
-            else:
-                tag, body = recv_message(client, timeout=2)
+            msg = recv_control(client, timeout=2)
+            if msg is None:
+                continue
+                
+            msg_type = msg.get("type")
             
-            if tag == TAG_CONTROL and isinstance(body, dict):
-                if body.get("type") == MSG_METADATA:
-                    metadata = body
-                    logger.info(f"Received metadata: {metadata['files'][0]['name']}")
+            # Handle challenge-response authentication
+            if msg_type == MSG_CHALLENGE and enc_config.get("auto_encrypt"):
+                challenge_received = True
+                nonce = msg.get("nonce")
+                
+                if not nonce:
+                    print("Error: Invalid challenge from sender.", file=sys.stderr)
+                    logger.error("Challenge missing nonce")
+                    cleanup()
+                    sys.exit(1)
+                
+                logger.info("Received authentication challenge")
+                print("Authenticating with sender...", file=sys.stderr)
+                
+                # Encrypt nonce with current time window key
+                try:
+                    derived_key, derived_salt = derive_time_based_key(
+                        enc_config['secret'], code, enc_config['key_window'], 0
+                    )
+                    
+                    salt_bytes = base64.b64decode(derived_salt)
+                    from mqtt_cat import Encryptor
+                    encryptor = Encryptor(
+                        password=derived_key,
+                        salt=salt_bytes,
+                        iterations=enc_config.get("encryption_iterations", 210000)
+                    )
+                    
+                    # Encrypt the nonce
+                    aad = f"{TOPIC_BASE}/{code}".encode()
+                    nonce_bytes = nonce.encode('ascii')
+                    encrypted = encryptor.encrypt(nonce_bytes, aad)
+                    encrypted_b64 = base64.b64encode(encrypted).decode('ascii')
+                    
+                    # Send challenge response
+                    send_control(client, MSG_CHALLENGE_RESPONSE, {"encrypted_nonce": encrypted_b64})
+                    logger.debug("Sent challenge response")
+                    
+                    # Wait for ACCEPTED or REJECTED
+                    auth_result = recv_control(client, timeout=60)
+                    if auth_result is None:
+                        print("Error: No authentication response from sender.", file=sys.stderr)
+                        logger.error("No authentication response received")
+                        cleanup()
+                        sys.exit(1)
+                    
+                    if auth_result.get("type") == MSG_ACCEPTED:
+                        window_offset = auth_result.get("window_offset", 0)
+                        logger.info(f"Authentication successful! Window offset: {window_offset}")
+                        print("✓ Authentication successful!", file=sys.stderr)
+                        
+                        # Update encryptor to use the correct window offset
+                        if window_offset != 0:
+                            derived_key, derived_salt = derive_time_based_key(
+                                enc_config['secret'], code, enc_config['key_window'], window_offset
+                            )
+                            salt_bytes = base64.b64decode(derived_salt)
+                            client.userdata["encryptor"] = Encryptor(
+                                password=derived_key,
+                                salt=salt_bytes,
+                                iterations=enc_config.get("encryption_iterations", 210000)
+                            )
+                        
+                        # Authentication successful, now wait for metadata
+                        # Don't break here - continue in the loop to receive metadata
+                        challenge_received = True
+                        
+                    elif auth_result.get("type") == MSG_REJECTED:
+                        attempts_remaining = auth_result.get("attempts_remaining", 0)
+                        is_final = auth_result.get("final", False)
+                        
+                        logger.warning(f"Authentication rejected. Attempts remaining: {attempts_remaining}")
+                        print(f"✗ Authentication failed. Attempts remaining: {attempts_remaining}", file=sys.stderr)
+                        
+                        if is_final:
+                            print("\nMaximum authentication attempts reached. Sender has exited.", file=sys.stderr)
+                        else:
+                            print("\nPlease check your --secret and try again.", file=sys.stderr)
+                        
+                        cleanup()
+                        sys.exit(1)
+                    
+                except Exception as e:
+                    print(f"Error during authentication: {e}", file=sys.stderr)
+                    logger.error(f"Authentication error: {e}", exc_info=True)
+                    cleanup()
+                    sys.exit(1)
+            
+            # Handle metadata (for non-auto-encrypt or after successful auth)
+            elif msg_type == MSG_METADATA:
+                metadata = msg
+                logger.info(f"Received metadata: {metadata['files'][0]['name']}")
+                break
 
         # Display file info
         file_info = metadata["files"][0]

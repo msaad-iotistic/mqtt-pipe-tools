@@ -58,7 +58,9 @@ Magic Wormhole-like file transfer over MQTT. Send files between machines using m
 
 ### Features
 - **Pairing codes** like `42-cosmic-dolphin` for easy sharing
+- **Challenge-response authentication** prevents unauthorized access (v2.0)
 - **Auto-encryption** enabled by default (time-based key derivation)
+- **Brute force protection** with 3-attempt limit
 - **Progress bars** with speed and ETA
 - **Multi-file/directory** support (auto-tarballed)
 - **SHA256 checksums** verified on receive
@@ -104,7 +106,7 @@ mqtt-wormhole --no-auto-encrypt myfile.pdf
 mqtt-wormhole --key-window 2000 myfile.pdf
 ```
 
-### Auto-Encryption
+### Auto-Encryption with Challenge-Response Authentication (v2.0)
 
 By default, mqtt-wormhole automatically encrypts transfers when no explicit encryption key is configured. This provides security without additional setup.
 
@@ -112,7 +114,24 @@ By default, mqtt-wormhole automatically encrypts transfers when no explicit encr
 - Encryption key is derived from: `secret + pairing_code + time_window`
 - Default secret is `'secret123'` (provides basic security)
 - Time windows prevent replay attacks (default: 1000 seconds ≈ 16 minutes)
-- Receiver tries ±1 time window to handle clock skew (total ~50 minutes validity)
+- **Challenge-response authentication** verifies receiver has correct key before sending files
+- Sender tries ±1 time window tolerance to handle clock skew
+- **3-attempt limit** prevents brute force attacks
+
+**Authentication Protocol:**
+1. Receiver sends READY
+2. Sender sends cleartext challenge (random nonce)
+3. Receiver encrypts nonce with their key and responds
+4. Sender decrypts response (tries ±1 windows) and verifies
+5. If correct: transfer proceeds
+6. If incorrect: connection terminates (allows retry with fixed secret)
+7. After 3 failed attempts: sender exits (code unusable)
+
+**Security benefits:**
+- Unauthorized receivers never see file metadata
+- Brute force prevention with 3-attempt limit
+- Early authentication before any data transfer
+- Clean retry mechanism for fixing typos
 
 **Security recommendations:**
 ```bash
@@ -129,6 +148,8 @@ mqtt-wormhole --no-auto-encrypt myfile.pdf
 ```
 
 **Note:** Auto-encryption is only enabled when you haven't configured `MQTT_ENCRYPTION_KEY` in your `.env` file or profiles. Explicit encryption keys always take precedence.
+
+**Breaking Change (v2.0):** The protocol has been updated with challenge-response authentication. Version 2.0 is not compatible with version 1.0 clients.
 
 ### Configuration
 
