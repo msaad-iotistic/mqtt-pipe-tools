@@ -4,12 +4,15 @@ Tools for piping data through MQTT brokers, including a Magic Wormhole-like file
 
 ## Quick Start
 
+### One-Line Install
 ```bash
-# Clone and install
-git clone https://github.com/Mohammad-Saad-Acacus/mqtt-pipe-tools.git
-cd mqtt-pipe-tools
-./install.sh
+curl -sSL https://raw.githubusercontent.com/Mohammad-Saad-Acacus/mqtt-pipe-tools/main/scripts/quick-install.sh | bash
+```
 
+This will clone to `~/.local/share/mqtt-pipe-tools`, install dependencies, and create the commands.
+
+### Usage
+```bash
 # Send a file (generates pairing code)
 mqtt-wormhole --host broker.emqx.io myfile.pdf
 # Output: Pairing code: 42-cosmic-dolphin
@@ -20,8 +23,20 @@ mqtt-wormhole --host broker.emqx.io --code 42-cosmic-dolphin
 
 ## Installation
 
-### Automatic (Recommended)
+### One-Line Install (Recommended)
 ```bash
+curl -sSL https://raw.githubusercontent.com/Mohammad-Saad-Acacus/mqtt-pipe-tools/main/scripts/quick-install.sh | bash
+```
+
+**Custom location:**
+```bash
+MQTT_TOOLS_DIR=~/tools/mqtt-pipe-tools bash <(curl -sSL https://raw.githubusercontent.com/Mohammad-Saad-Acacus/mqtt-pipe-tools/main/scripts/quick-install.sh)
+```
+
+### Manual Install
+```bash
+git clone https://github.com/Mohammad-Saad-Acacus/mqtt-pipe-tools.git
+cd mqtt-pipe-tools
 ./install.sh              # Install for current user
 sudo ./install.sh         # Install system-wide
 ./install.sh --uninstall  # Remove
@@ -32,7 +47,7 @@ The installer will:
 - Install dependencies automatically
 - Create `mqtt-wormhole` and `mqttcat` commands
 
-### Manual
+### Dependencies Only
 ```bash
 pip install -r requirements.txt
 ```
