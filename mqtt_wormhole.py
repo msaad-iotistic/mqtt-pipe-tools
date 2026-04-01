@@ -6,6 +6,7 @@ Send files:    mqtt-wormhole myfile.pdf
 Receive files: mqtt-wormhole
 """
 import argparse
+import base64
 import hashlib
 import io
 import json
@@ -220,13 +221,38 @@ def build_profile(args, env_config: dict) -> dict:
     return profile
 
 
-def get_encryption_config(args, env_config: dict) -> dict:
-    """Get encryption settings from args/env."""
+def get_encryption_config(args, env_config: dict, code: str = None) -> dict:
+    """Get encryption settings from args/env, with auto-encryption support."""
     enc = {}
-    enc["encryption_key"] = args.encryption_key or env_config.get("encryption_key")
+    
+    # Check for explicit encryption configuration
+    explicit_key = args.encryption_key or env_config.get("encryption_key")
+    enc["encryption_key"] = explicit_key
     enc["encryption_salt"] = args.encryption_salt or env_config.get("encryption_salt")
     iterations = args.encryption_iterations or env_config.get("encryption_iterations")
     enc["encryption_iterations"] = int(iterations) if iterations else 210000
+    
+    # Auto-encryption: enabled when no explicit key and not disabled
+    enc["auto_encrypt"] = False
+    enc["secret"] = args.secret
+    enc["key_window"] = args.key_window
+    
+    if not explicit_key and not args.no_auto_encrypt and code:
+        # Enable auto-encryption
+        enc["auto_encrypt"] = True
+        derived_key, derived_salt = derive_time_based_key(args.secret, code, args.key_window)
+        enc["encryption_key"] = derived_key
+        enc["encryption_salt"] = derived_salt
+        
+        # Warn if using default secret
+        if args.secret == "secret123":
+            logger.warning("Using default secret 'secret123' for auto-encryption. "
+                         "For better security, use --secret with a custom value.")
+            print("⚠️  Warning: Using default secret for encryption. "
+                  "Use --secret for better security.", file=sys.stderr)
+        else:
+            logger.info(f"Auto-encryption enabled with custom secret")
+    
     return enc
 
 
@@ -241,6 +267,36 @@ def get_transfer_config(args, env_config: dict) -> dict:
         "chunk_size": chunk_size,
         "compression_type": compression_type,
     }
+
+
+def derive_time_based_key(secret: str, code: str, window_size: int = 1000, time_offset: int = 0) -> tuple:
+    """
+    Derive encryption key from secret + code + time window.
+    
+    Args:
+        secret: User-provided secret (default: 'secret123')
+        code: Pairing code
+        window_size: Time window in seconds (default: 1000)
+        time_offset: Offset in windows for ±1 tolerance (0, -1, or +1)
+    
+    Returns:
+        (encryption_key, encryption_salt) tuple
+    """
+    current_time = int(time.time())
+    time_window = (current_time // window_size) + time_offset
+    
+    # Create password from secret + code
+    password = f"{secret}-{code}"
+    
+    # Use time_window as salt (convert to 8-byte representation)
+    salt = time_window.to_bytes(8, byteorder='big', signed=True)
+    
+    # Encode salt as base64 for compatibility with existing encryption system
+    salt_b64 = base64.b64encode(salt).decode('ascii')
+    
+    logger.debug(f"Time-based key derivation: window={time_window}, offset={time_offset}, salt={salt_b64}")
+    
+    return password, salt_b64
 
 
 def compute_sha256(filepath: str) -> str:
@@ -472,16 +528,86 @@ def create_client(mode: str, code: str, profile: dict, enc_config: dict,
     )
 
 
+def recv_message_with_retry(client: MQTTNetcat, enc_config: dict, code: str, timeout: float = 60):
+    """
+    Receive message with ±1 time window tolerance for auto-encryption.
+    For auto-encryption, tries to decrypt with current, previous, and next time windows.
+    Returns (tag, body, successful_offset) or (None, None, None) on timeout/failure.
+    """
+    if not enc_config.get("auto_encrypt"):
+        # Not using auto-encryption, use normal receive
+        tag, body = recv_message(client, timeout)
+        return tag, body, 0
+    
+    # Receive the raw encrypted message first
+    raw = client.receive(timeout=timeout)
+    if raw is None or len(raw) == 0:
+        return None, None, None
+    
+    tag = raw[0]
+    encrypted_body = raw[1:]
+    
+    # For control messages, try decrypting with ±1 time windows
+    if tag == TAG_CONTROL:
+        secret = enc_config.get("secret")
+        key_window = enc_config.get("key_window", 1000)
+        iterations = enc_config.get("encryption_iterations", 210000)
+        
+        # Try current window first, then -1, then +1
+        for offset in [0, -1, 1]:
+            try:
+                # Derive key for this time window
+                derived_key, derived_salt = derive_time_based_key(secret, code, key_window, offset)
+                
+                # Create encryptor with this window's key
+                salt_bytes = base64.b64decode(derived_salt) if derived_salt else b""
+                from mqtt_cat import Encryptor
+                encryptor = Encryptor(password=derived_key, salt=salt_bytes, iterations=iterations)
+                
+                # Try to decrypt
+                # AAD (Additional Authenticated Data) is the topic, same as in mqtt_cat
+                aad = f"{TOPIC_BASE}/{code}".encode()
+                decrypted = encryptor.decrypt(encrypted_body, aad)
+                
+                # Try to parse as JSON
+                body = json.loads(decrypted.decode())
+                
+                if offset != 0:
+                    logger.info(f"Successfully decrypted with time window offset {offset}")
+                    # Update client's encryptor to use the successful key
+                    client.userdata["encryptor"] = encryptor
+                
+                return TAG_CONTROL, body, offset
+                
+            except Exception as e:
+                # Decryption/parsing failed with this window, try next
+                logger.debug(f"Decryption failed with offset {offset}: {e}")
+                continue
+        
+        # All windows failed
+        logger.error("Failed to decrypt with any time window (0, -1, +1)")
+        return None, None, None
+    
+    elif tag == TAG_DATA:
+        # For data chunks, use the client's current encryptor (already set from control message)
+        return TAG_DATA, encrypted_body, 0
+    
+    return None, None, None
+
+
 # ─── SEND MODE ──────────────────────────────────────────────────────────────
 
 def do_send(args, env_config: dict):
     """Handle sending files."""
     profile = build_profile(args, env_config)
-    enc_config = get_encryption_config(args, env_config)
+    
+    code = args.code or generate_code()
+    enc_config = get_encryption_config(args, env_config, code)
     transfer_config = get_transfer_config(args, env_config)
 
-    code = args.code or generate_code()
     logger.info(f"Starting send mode with code: {code}")
+    if enc_config.get("auto_encrypt"):
+        logger.info(f"Auto-encryption enabled (window: {enc_config['key_window']}s)")
 
     # Collect file metadata and prepare tarball if needed
     metadata, tar_path = collect_file_metadata(args.files)
@@ -491,9 +617,17 @@ def do_send(args, env_config: dict):
 
     print(file=sys.stderr)
     print(f"Your pairing code is: \033[1;36m{code}\033[0m", file=sys.stderr)
+    if enc_config.get("auto_encrypt"):
+        if enc_config.get("secret") == "secret123":
+            print(f"🔒 Auto-encryption: enabled (default secret)", file=sys.stderr)
+        else:
+            print(f"🔒 Auto-encryption: enabled (custom secret)", file=sys.stderr)
     print(file=sys.stderr)
     print(f"On the receiving end, run:", file=sys.stderr)
-    print(f"  \033[1mmqtt-wormhole --code {code}\033[0m", file=sys.stderr)
+    if enc_config.get("auto_encrypt") and enc_config.get("secret") != "secret123":
+        print(f"  \033[1mmqtt-wormhole --code {code} --secret {enc_config['secret']}\033[0m", file=sys.stderr)
+    else:
+        print(f"  \033[1mmqtt-wormhole --code {code}\033[0m", file=sys.stderr)
     print(file=sys.stderr)
 
     # Sender uses "connect" mode (publishes to prefix/listen, subscribes to prefix/connect)
@@ -606,9 +740,7 @@ def do_send(args, env_config: dict):
 def do_receive(args, env_config: dict):
     """Handle receiving files."""
     profile = build_profile(args, env_config)
-    enc_config = get_encryption_config(args, env_config)
-    transfer_config = get_transfer_config(args, env_config)
-
+    
     code = args.code
     if not code:
         try:
@@ -620,12 +752,22 @@ def do_receive(args, env_config: dict):
         print("Error: No pairing code provided.", file=sys.stderr)
         sys.exit(1)
 
+    enc_config = get_encryption_config(args, env_config, code)
+    transfer_config = get_transfer_config(args, env_config)
+
     logger.info(f"Starting receive mode with code: {code}")
+    if enc_config.get("auto_encrypt"):
+        logger.info(f"Auto-encryption enabled (window: {enc_config['key_window']}s)")
     output_dir = Path(args.output).resolve() if args.output else Path.cwd()
     output_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Output directory: {output_dir}")
 
     print(f"Connecting to broker...", file=sys.stderr)
+    if enc_config.get("auto_encrypt"):
+        if enc_config.get("secret") == "secret123":
+            print(f"🔒 Auto-encryption: enabled (default secret)", file=sys.stderr)
+        else:
+            print(f"🔒 Auto-encryption: enabled (custom secret)", file=sys.stderr)
     logger.info(f"Connecting to broker: {profile.get('host', 'default')}:{profile.get('port', 1883)}")
 
     # Receiver uses "listen" mode (publishes to prefix/connect, subscribes to prefix/listen)
@@ -660,6 +802,7 @@ def do_receive(args, env_config: dict):
         logger.info("Sending READY messages, waiting for metadata")
         metadata = None
         last_ready = 0
+        successful_offset = None
 
         while metadata is None:
             now = time.monotonic()
@@ -667,7 +810,13 @@ def do_receive(args, env_config: dict):
                 send_control(client, MSG_READY)
                 last_ready = now
 
-            tag, body = recv_message(client, timeout=2)
+            if enc_config.get("auto_encrypt"):
+                tag, body, offset = recv_message_with_retry(client, enc_config, code, timeout=2)
+                if successful_offset is None and offset is not None:
+                    successful_offset = offset
+            else:
+                tag, body = recv_message(client, timeout=2)
+            
             if tag == TAG_CONTROL and isinstance(body, dict):
                 if body.get("type") == MSG_METADATA:
                     metadata = body
@@ -707,6 +856,8 @@ def do_receive(args, env_config: dict):
 
         with make_progress_bar(total_size, desc) as pbar:
             while not done:
+                # After first successful decrypt, we can use normal recv_message
+                # since the client's encryptor is already set to the correct key
                 tag, body = recv_message(client, timeout=30)
                 if tag is None:
                     continue
@@ -845,6 +996,12 @@ def build_parser() -> argparse.ArgumentParser:
     enc_group.add_argument("--encryption-key", "-e", type=str, help="Encryption key")
     enc_group.add_argument("--encryption-salt", type=str, help="Encryption salt (base64)")
     enc_group.add_argument("--encryption-iterations", type=int, help="PBKDF2 iterations")
+    enc_group.add_argument("--secret", "-s", type=str, default="secret123", 
+                          help="Secret for auto-encryption key derivation (default: 'secret123')")
+    enc_group.add_argument("--key-window", type=int, default=1000,
+                          help="Time window in seconds for auto-encryption key validity (default: 1000)")
+    enc_group.add_argument("--no-auto-encrypt", action="store_true",
+                          help="Disable automatic encryption (when no explicit key is configured)")
 
     xfer_group = parser.add_argument_group("Transfer")
     xfer_group.add_argument("--qos", type=int, choices=[0, 1, 2], default=None, help="QoS level (default: 1)")
