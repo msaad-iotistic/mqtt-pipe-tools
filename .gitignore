@@ -4,3 +4,4 @@ files/
 mqtt_profiles.json
 *.crt
 *.key
+.env
