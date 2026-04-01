@@ -58,11 +58,12 @@ Magic Wormhole-like file transfer over MQTT. Send files between machines using m
 
 ### Features
 - **Pairing codes** like `42-cosmic-dolphin` for easy sharing
+- **Auto-encryption** enabled by default (time-based key derivation)
 - **Progress bars** with speed and ETA
 - **Multi-file/directory** support (auto-tarballed)
 - **SHA256 checksums** verified on receive
 - **Compression** enabled by default (deflate)
-- **Encryption** support via mqtt-cat
+- **Manual encryption** support via mqtt-cat
 
 ### Usage
 
@@ -90,7 +91,44 @@ mqtt-wormhole --code 42-cosmic-dolphin --output ~/Downloads/
 
 # Specify broker
 mqtt-wormhole --host broker.example.com --port 8883 --tls myfile.pdf
+
+# Use custom secret for auto-encryption (recommended)
+mqtt-wormhole --secret mysecret123 myfile.pdf
+# Receiver must use the same secret:
+mqtt-wormhole --code 42-cosmic-dolphin --secret mysecret123
+
+# Disable auto-encryption
+mqtt-wormhole --no-auto-encrypt myfile.pdf
+
+# Adjust time window for key validity (default: 1000 seconds)
+mqtt-wormhole --key-window 2000 myfile.pdf
 ```
+
+### Auto-Encryption
+
+By default, mqtt-wormhole automatically encrypts transfers when no explicit encryption key is configured. This provides security without additional setup.
+
+**How it works:**
+- Encryption key is derived from: `secret + pairing_code + time_window`
+- Default secret is `'secret123'` (provides basic security)
+- Time windows prevent replay attacks (default: 1000 seconds ≈ 16 minutes)
+- Receiver tries ±1 time window to handle clock skew (total ~50 minutes validity)
+
+**Security recommendations:**
+```bash
+# Use a custom secret for better security
+mqtt-wormhole --secret "my-strong-secret-phrase" myfile.pdf
+
+# On receiver (must use same secret):
+mqtt-wormhole --code 42-cosmic-dolphin --secret "my-strong-secret-phrase"
+```
+
+**Disable auto-encryption:**
+```bash
+mqtt-wormhole --no-auto-encrypt myfile.pdf
+```
+
+**Note:** Auto-encryption is only enabled when you haven't configured `MQTT_ENCRYPTION_KEY` in your `.env` file or profiles. Explicit encryption keys always take precedence.
 
 ### Configuration
 
@@ -113,8 +151,15 @@ cp .env.example .env
 | `MQTT_USERNAME` | Authentication username |
 | `MQTT_PASSWORD` | Authentication password |
 | `MQTT_TLS` | Enable TLS (true/false) |
-| `MQTT_ENCRYPTION_KEY` | End-to-end encryption key |
+| `MQTT_ENCRYPTION_KEY` | Manual end-to-end encryption key (disables auto-encryption) |
 | `MQTT_COMPRESSION` | Compression (deflate/none) |
+
+**Auto-encryption CLI options:**
+| Option | Description |
+|--------|-------------|
+| `--secret` | Secret for auto-encryption (default: 'secret123') |
+| `--key-window` | Time window in seconds for key validity (default: 1000) |
+| `--no-auto-encrypt` | Disable automatic encryption |
 
 ## mqtt-cat
 

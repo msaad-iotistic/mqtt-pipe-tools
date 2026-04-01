@@ -498,12 +498,14 @@ def collect_file_metadata(paths: list):
         })
         transfer_type = "single"
         total_size = size
+        file_count = 1
 
     metadata = {
         "version": PROTOCOL_VERSION,
         "transfer_type": transfer_type,
         "files": files_meta,
         "total_size": total_size,
+        "file_count": file_count if transfer_type != "single" else 1,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     return metadata, tar_path
