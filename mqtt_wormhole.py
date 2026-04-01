@@ -289,14 +289,14 @@ def derive_time_based_key(secret: str, code: str, window_size: int = 1000, time_
     password = f"{secret}-{code}"
     
     # Ensure password meets minimum 32 character requirement for Encryptor
-    # Pad with time window information if needed
+    # Pad with static string if needed (time window is in salt, not password)
     if len(password) < 32:
-        # Pad with time window to make it unique and meet length requirement
-        padding = f"-tw{time_window}"
+        # Pad with a static suffix to reach minimum length
+        # Use a repeating pattern that doesn't include time_window
+        # so sender and receiver with different time windows still match
+        padding_needed = 32 - len(password)
+        padding = "-mqtt-wormhole-auto-encrypt"[:padding_needed]
         password = password + padding
-        # If still too short, repeat the padding pattern
-        while len(password) < 32:
-            password = password + f"-{time_window}"
     
     # Use time_window as salt (convert to 8-byte representation)
     salt = time_window.to_bytes(8, byteorder='big', signed=True)
