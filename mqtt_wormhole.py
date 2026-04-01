@@ -91,6 +91,11 @@ def generate_code(num_words: int = 2) -> str:
     return f"{number}-{'-'.join(chosen)}"
 
 
+def hash_code(code: str) -> str:
+    """Hash a pairing code for use in MQTT topics."""
+    return hashlib.sha256(code.encode('utf-8')).hexdigest()[:16]
+
+
 def parse_env_file(filepath: str) -> dict:
     """Parse a .env file into a dict of key=value pairs."""
     env = {}
@@ -528,7 +533,8 @@ def collect_file_metadata(paths: list):
 def create_client(mode: str, code: str, profile: dict, enc_config: dict,
                   transfer_config: dict, verbose: bool = False) -> MQTTNetcat:
     """Create a single MQTTNetcat instance for the given code."""
-    prefix = f"{TOPIC_BASE}/{code}"
+    hashed_code = hash_code(code)
+    prefix = f"{TOPIC_BASE}/{hashed_code}"
     return MQTTNetcat(
         mode=mode,
         prefix=prefix,
