@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 import zlib  # Added for compression
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypedDict, Union
+from typing import Any, Callable, Dict, Optional, TypedDict, Union
 
 import paho.mqtt.client as mqtt
 from cryptography.hazmat.backends import default_backend
@@ -198,7 +198,7 @@ class MQTTNetcat:
         self,
         mode: str,
         prefix: str,
-        profile: Union[Dict[str, Any], str, None] = None,
+        profile: Union[ProfileType, str, None] = None,
         profile_name: Optional[str] = None,
         profiles_file: Optional[str] = None,
         qos: int = DEFAULTS["QOS"],
@@ -212,6 +212,9 @@ class MQTTNetcat:
         quiet: bool = False,
         log_file: Optional[str] = None,
         receive_callback: Optional[Callable[[bytes], None]] = None,
+        encryption_key: Optional[str] = None,
+        encryption_salt: Optional[str] = None,
+        encryption_iterations: int = 210000,
     ):
         """
         Initialize MQTTNetcat instance
@@ -243,12 +246,15 @@ class MQTTNetcat:
         self.chunk_size = chunk_size
         self.max_pending = max_pending
         self.qos0_delay = qos0_delay
-        self.compression_type = compression_type  # Added
-        self.compression_level = compression_level  # Added
+        self.compression_type = compression_type
+        self.compression_level = compression_level
         self.verbose = verbose
         self.quiet = quiet
         self.log_file = log_file
         self.receive_callback = receive_callback
+        self.encryption_key = encryption_key
+        self.encryption_salt = encryption_salt
+        self.encryption_iterations = encryption_iterations
 
         # Runtime state
         self.logger = self._setup_logging()
@@ -419,20 +425,21 @@ class MQTTNetcat:
         if not self.profile:
             return
 
-        if "encryption_key" in self.profile:
+        encryption_key = self.encryption_key or self.profile.get("encryption_key")
+        encryption_salt = self.encryption_salt or self.profile.get("encryption_salt")
+        encryption_iterations = self.encryption_iterations or self.profile.get(
+            "encryption_iterations", 210000
+        )
+
+        if encryption_key:
             try:
-                salt = (
-                    base64.b64decode(self.profile["encryption_salt"])
-                    if "encryption_salt" in self.profile
-                    else b""
-                )
-                iterations = self.profile.get("encryption_iterations", 210000)
+                salt = base64.b64decode(encryption_salt) if encryption_salt else b""
                 self.userdata["encryptor"] = Encryptor(
-                    self.profile["encryption_key"], salt, iterations
+                    password=encryption_key, salt=salt, iterations=encryption_iterations
                 )
                 self.logger.info("Encryption enabled")
                 self.logger.debug(f"Using salt: {base64.b64encode(salt).decode()}")
-                self.logger.debug(f"PBKDF2 iterations: {iterations}")
+                self.logger.debug(f"PBKDF2 iterations: {encryption_iterations}")
             except Exception as e:
                 self.logger.error(f"Encryption setup failed: {str(e)}")
                 raise
