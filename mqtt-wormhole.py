@@ -32,6 +32,8 @@ from mqttcat import MQTTNetcat, COMPRESSION_TYPES, COMPRESSION_NONE
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 WORDLIST_FILE = os.path.join(SCRIPT_DIR, "wordlist.txt")
 ENV_FILE = os.path.join(SCRIPT_DIR, ".env")
+DEFAULT_PROFILES_FILE = "/opt/config/mqtt_profiles.json"
+DEFAULT_PROFILE_NAME = "iotistic"
 PROTOCOL_VERSION = "1.0"
 TOPIC_BASE = "wormhole"
 
@@ -101,35 +103,77 @@ def parse_env_file(filepath: str) -> dict:
     return env
 
 
-def load_env_config() -> dict:
-    """Load configuration from .env file."""
+def load_profiles_config() -> dict:
+    """Load configuration from mqtt_profiles.json."""
     config = {}
-    if not os.path.exists(ENV_FILE):
+    if not os.path.exists(DEFAULT_PROFILES_FILE):
         return config
-
-    env = parse_env_file(ENV_FILE)
-    mapping = {
-        "MQTT_HOST": "host",
-        "MQTT_PORT": "port",
-        "MQTT_USERNAME": "username",
-        "MQTT_PASSWORD": "password",
-        "MQTT_TLS": "tls",
-        "MQTT_INSECURE": "insecure",
-        "MQTT_CA_CERTS": "ca_certs",
-        "MQTT_CERTFILE": "certfile",
-        "MQTT_KEYFILE": "keyfile",
-        "MQTT_ENCRYPTION_KEY": "encryption_key",
-        "MQTT_ENCRYPTION_SALT": "encryption_salt",
-        "MQTT_ENCRYPTION_ITERATIONS": "encryption_iterations",
-        "MQTT_QOS": "qos",
-        "MQTT_CHUNK_SIZE": "chunk_size",
-        "MQTT_COMPRESSION": "compression",
-    }
-    for env_key, conf_key in mapping.items():
-        val = env.get(env_key)
-        if val is not None and val != "":
-            config[conf_key] = val
+    
+    try:
+        with open(DEFAULT_PROFILES_FILE, "r") as f:
+            profiles = json.load(f)
+        
+        if DEFAULT_PROFILE_NAME in profiles:
+            profile = profiles[DEFAULT_PROFILE_NAME]
+            # Map profile keys to our config keys
+            key_mapping = {
+                "host": "host",
+                "port": "port",
+                "username": "username",
+                "password": "password",
+                "tls": "tls",
+                "insecure": "insecure",
+                "ca_certs": "ca_certs",
+                "certfile": "certfile",
+                "keyfile": "keyfile",
+                "encryption_key": "encryption_key",
+                "encryption_salt": "encryption_salt",
+                "encryption_iterations": "encryption_iterations",
+                "qos": "qos",
+                "chunk_size": "chunk_size",
+                "compression": "compression",
+            }
+            for profile_key, conf_key in key_mapping.items():
+                if profile_key in profile and profile[profile_key]:
+                    config[conf_key] = profile[profile_key]
+    except Exception:
+        pass
+    
     return config
+
+
+def load_env_config() -> dict:
+    """Load configuration from .env file, fallback to mqtt_profiles.json."""
+    config = {}
+    
+    # Priority 1: .env file
+    if os.path.exists(ENV_FILE):
+        env = parse_env_file(ENV_FILE)
+        mapping = {
+            "MQTT_HOST": "host",
+            "MQTT_PORT": "port",
+            "MQTT_USERNAME": "username",
+            "MQTT_PASSWORD": "password",
+            "MQTT_TLS": "tls",
+            "MQTT_INSECURE": "insecure",
+            "MQTT_CA_CERTS": "ca_certs",
+            "MQTT_CERTFILE": "certfile",
+            "MQTT_KEYFILE": "keyfile",
+            "MQTT_ENCRYPTION_KEY": "encryption_key",
+            "MQTT_ENCRYPTION_SALT": "encryption_salt",
+            "MQTT_ENCRYPTION_ITERATIONS": "encryption_iterations",
+            "MQTT_QOS": "qos",
+            "MQTT_CHUNK_SIZE": "chunk_size",
+            "MQTT_COMPRESSION": "compression",
+        }
+        for env_key, conf_key in mapping.items():
+            val = env.get(env_key)
+            if val is not None and val != "":
+                config[conf_key] = val
+        return config
+    
+    # Priority 2: mqtt_profiles.json
+    return load_profiles_config()
 
 
 def build_profile(args, env_config: dict) -> dict:
