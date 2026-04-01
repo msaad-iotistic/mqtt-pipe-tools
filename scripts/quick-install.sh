@@ -129,6 +129,47 @@ else
     print_success "Repository cloned"
 fi
 
+# Remove broken symlinks from previous versions
+remove_old_links() {
+    local removed=0
+    local bin_locations=("$HOME/.local/bin" "$HOME/bin" "/usr/local/bin")
+    
+    print_info "Checking for broken mqtt-pipe-tools symlinks..."
+    
+    for bin_dir in "${bin_locations[@]}"; do
+        if [ ! -d "$bin_dir" ]; then
+            continue
+        fi
+        
+        # Check all items in bin directory for broken symlinks
+        for item in "$bin_dir"/*; do
+            # Check if it's a broken symlink (exists as link but target doesn't)
+            if [ -L "$item" ] && [ ! -e "$item" ]; then
+                # Check if the symlink target was related to mqtt-pipe-tools
+                local target=$(readlink "$item" 2>/dev/null || echo "")
+                if [[ "$target" == *"mqtt-pipe-tools"* ]]; then
+                    if rm -f "$item" 2>/dev/null; then
+                        print_success "Removed broken mqtt-pipe-tools symlink: $(basename "$item")"
+                        ((removed++))
+                    else
+                        print_warning "Could not remove broken symlink: $(basename "$item") (may need sudo)"
+                    fi
+                fi
+            fi
+        done
+    done
+    
+    if [ $removed -gt 0 ]; then
+        print_success "Cleaned up $removed mqtt-pipe-tools symlink(s)"
+    else
+        print_success "No broken mqtt-pipe-tools symlinks found"
+    fi
+}
+
+# Run cleanup
+remove_old_links
+echo ""
+
 # Run installer
 cd "$INSTALL_DIR"
 echo ""
