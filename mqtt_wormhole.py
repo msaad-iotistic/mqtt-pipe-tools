@@ -181,6 +181,7 @@ def load_env_config() -> dict:
             "MQTT_QOS": "qos",
             "MQTT_CHUNK_SIZE": "chunk_size",
             "MQTT_COMPRESSION": "compression",
+            "MQTT_FORCE_OVERWRITE": "force_overwrite",
         }
         for env_key, conf_key in mapping.items():
             val = env.get(env_key)
@@ -200,7 +201,7 @@ def build_profile(args, env_config: dict) -> dict:
         if key in env_config:
             profile[key] = env_config[key]
 
-    for key in ["tls", "insecure"]:
+    for key in ["tls", "insecure", "force_overwrite"]:
         if key in env_config:
             profile[key] = env_config[key].lower() in ("true", "1", "yes")
 
@@ -220,6 +221,8 @@ def build_profile(args, env_config: dict) -> dict:
         profile["insecure"] = True
     if args.ca_certs:
         profile["ca_certs"] = args.ca_certs
+    if args.force_overwrite:
+        profile["force_overwrite"] = True
 
     if "host" not in profile:
         print("Error: No MQTT host specified. Use --host or set MQTT_HOST in .env", file=sys.stderr)
@@ -983,6 +986,56 @@ def do_receive(args, env_config: dict):
             print(f"Receiving: {file_info['name']} ({human_size(total_size)})", file=sys.stderr)
         print(file=sys.stderr)
 
+        # Check for existing file and handle overwrite confirmation early
+        out_file = output_dir / file_info["name"]
+        force_overwrite = profile.get("force_overwrite", False)
+        
+        if out_file.exists() and not force_overwrite:
+            print(f"File '{out_file.name}' already exists!", file=sys.stderr)
+            while True:
+                try:
+                    response = input("Overwrite? [y=overwrite/N=cancel/r=rename] ").strip().lower()
+                    if response in ["", "n", "no"]:
+                        print("Transfer cancelled by user.", file=sys.stderr)
+                        cleanup()
+                        sys.exit(0)
+                    elif response in ["y", "yes"]:
+                        break
+                    elif response in ["r", "rename"]:
+                        while True:
+                            try:
+                                new_name = input("Enter new filename: ").strip()
+                                if not new_name:
+                                    print("Filename cannot be empty.", file=sys.stderr)
+                                    continue
+                                # Validate for path traversal and invalid characters
+                                if '/' in new_name or '\\' in new_name or '\0' in new_name:
+                                    print("Invalid filename: cannot contain path separators.", file=sys.stderr)
+                                    continue
+                                if new_name.startswith('.'):
+                                    print("Invalid filename: cannot start with a dot.", file=sys.stderr)
+                                    continue
+                                new_out_file = output_dir / new_name
+                                if new_out_file.exists():
+                                    print(f"File '{new_name}' also exists. Please choose another name.", file=sys.stderr)
+                                    continue
+                                out_file = new_out_file
+                                print(f"Will save as: {out_file.name}", file=sys.stderr)
+                                break
+                            except (EOFError, KeyboardInterrupt):
+                                print("\nTransfer cancelled.", file=sys.stderr)
+                                cleanup()
+                                sys.exit(0)
+                        break
+                    else:
+                        print("Please enter 'y', 'n', or 'r'", file=sys.stderr)
+                except (EOFError, KeyboardInterrupt):
+                    print("\nTransfer cancelled.", file=sys.stderr)
+                    cleanup()
+                    sys.exit(0)
+        elif out_file.exists() and force_overwrite:
+            print(f"Will overwrite existing file: {out_file.name}", file=sys.stderr)
+
         # Accept transfer
         send_control(client, MSG_ACK)
         logger.info("Sent ACK, starting data reception")
@@ -1043,7 +1096,6 @@ def do_receive(args, env_config: dict):
             logger.warning(f"Checksum mismatch! Expected: {expected_checksum}, Got: {actual_checksum}")
 
         # Save file
-        out_file = output_dir / file_info["name"]
         received_data.seek(0)
         with open(str(out_file), "wb") as f:
             while True:
@@ -1146,6 +1198,7 @@ def build_parser() -> argparse.ArgumentParser:
     xfer_group.add_argument("--qos", type=int, choices=[0, 1, 2], default=None, help="QoS level (default: 1)")
     xfer_group.add_argument("--chunk-size", type=int, default=None, help="Chunk size in bytes (default: 65536)")
     xfer_group.add_argument("--compress", choices=list(COMPRESSION_TYPES.keys()), default=None, help="Compression")
+    xfer_group.add_argument("--force-overwrite", action="store_true", help="Automatically overwrite existing files without confirmation (bypasses overwrite/rename prompt)")
 
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
     parser.add_argument("--log-file", type=str, default=None, help=f"Log file path (default: {DEFAULT_LOG_FILE})")

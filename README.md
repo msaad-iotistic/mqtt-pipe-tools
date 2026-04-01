@@ -104,6 +104,10 @@ mqtt-wormhole --no-auto-encrypt myfile.pdf
 
 # Adjust time window for key validity (default: 1000 seconds)
 mqtt-wormhole --key-window 2000 myfile.pdf
+
+# Handle existing files
+mqtt-wormhole --code 42-cosmic-dolphin  # Will prompt if file exists
+mqtt-wormhole --code 42-cosmic-dolphin --force-overwrite  # Auto-overwrite without prompt
 ```
 
 ### Auto-Encryption with Challenge-Response Authentication (v2.0)
@@ -151,6 +155,41 @@ mqtt-wormhole --no-auto-encrypt myfile.pdf
 
 **Breaking Change (v2.0):** The protocol has been updated with challenge-response authentication. Version 2.0 is not compatible with version 1.0 clients.
 
+### File Overwrite Handling
+
+When receiving a file that already exists, mqtt-wormhole provides three options:
+
+```
+File 'document.pdf' already exists!
+Overwrite? [y=overwrite/N=cancel/r=rename] 
+```
+
+**Options:**
+- **`y`** - Overwrite the existing file
+- **`n`** or **Enter** - Cancel the transfer
+- **`r`** - Enter a new filename
+
+**Rename Flow:**
+```
+Enter new filename: document_v2.pdf
+Will save as: document_v2.pdf
+```
+
+**Security Features:**
+- Path traversal prevention (blocks `/` and `\`)
+- Null byte injection prevention
+- Hidden file prevention (blocks names starting with `.`)
+- Validates that the new filename doesn't already exist
+
+**Automatic Overwrite:**
+```bash
+# CLI flag to auto-overwrite without prompting
+mqtt-wormhole --code 42-cosmic-dolphin --force-overwrite
+
+# Environment variable for persistent behavior
+echo "MQTT_FORCE_OVERWRITE=true" >> .env
+```
+
 ### Configuration
 
 Configuration is loaded in this order (first found wins):
@@ -174,6 +213,7 @@ cp .env.example .env
 | `MQTT_TLS` | Enable TLS (true/false) |
 | `MQTT_ENCRYPTION_KEY` | Manual end-to-end encryption key (disables auto-encryption) |
 | `MQTT_COMPRESSION` | Compression (deflate/none) |
+| `MQTT_FORCE_OVERWRITE` | Auto-overwrite existing files without confirmation (true/false) |
 
 **Auto-encryption CLI options:**
 | Option | Description |
@@ -181,6 +221,11 @@ cp .env.example .env
 | `--secret` | Secret for auto-encryption (default: 'secret123') |
 | `--key-window` | Time window in seconds for key validity (default: 1000) |
 | `--no-auto-encrypt` | Disable automatic encryption |
+
+**Transfer CLI options:**
+| Option | Description |
+|--------|-------------|
+| `--force-overwrite` | Auto-overwrite existing files without confirmation |
 
 ## mqtt-cat
 
