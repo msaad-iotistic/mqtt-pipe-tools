@@ -55,15 +55,17 @@ check_existing_install() {
             install_location=$(readlink -f "$cmd_path" 2>/dev/null || readlink "$cmd_path")
         elif [ -f "$cmd_path" ]; then
             # It's a wrapper script - extract the path from exec line
-            # Wrapper format: exec /path/to/python /path/to/mqtt_wormhole.py "$@"
-            install_location=$(grep -oE '/[^ ]+/mqtt_wormhole\.py' "$cmd_path" 2>/dev/null | head -1 || echo "")
+            # Look for any path containing mqtt-pipe-tools
+            install_location=$(grep -oE '/[^"]+mqtt-pipe-tools/[^"]*' "$cmd_path" 2>/dev/null | head -1 || echo "")
+            if [ -n "$install_location" ]; then
+                # Extract the directory containing mqtt-pipe-tools
+                if [[ "$install_location" == *"/mqtt-pipe-tools"* ]]; then
+                    install_location=$(echo "$install_location" | sed 's|/mqtt-pipe-tools/.*|/mqtt-pipe-tools|')
+                fi
+            fi
         fi
         
         if [ -n "$install_location" ]; then
-            # Get the directory containing the scripts
-            if [[ "$install_location" == *"/mqtt_wormhole.py" ]]; then
-                install_location=$(dirname "$install_location")
-            fi
             echo "$install_location"
             return 0
         fi
