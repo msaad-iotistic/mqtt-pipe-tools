@@ -506,6 +506,7 @@ def collect_file_metadata(paths: list):
         })
         transfer_type = "multi"
         total_size = tar_size
+        file_count = len(resolved)
 
     # Single file
     else:
