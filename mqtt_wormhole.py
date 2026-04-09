@@ -321,6 +321,89 @@ def derive_time_based_key(secret: str, code: str, window_size: int = 1000, time_
     return password, salt_b64
 
 
+def check_path_stability(path: Path, interval: float = 1.0) -> list:
+    """Check if files under path are still being written to.
+    
+    Samples file sizes and mtimes twice, separated by `interval` seconds.
+    Returns list of (filepath, reason) tuples for unstable files.
+    """
+    def snapshot(root: Path):
+        snap = {}
+        targets = root.rglob("*") if root.is_dir() else [root]
+        for f in targets:
+            if not f.is_file():
+                continue
+            try:
+                st = f.stat()
+                snap[str(f)] = (st.st_size, st.st_mtime)
+            except OSError:
+                snap[str(f)] = (None, None)
+        return snap
+
+    snap1 = snapshot(path)
+    time.sleep(interval)
+    snap2 = snapshot(path)
+
+    unstable = []
+    for fpath, (sz1, mt1) in snap1.items():
+        sz2, mt2 = snap2.get(fpath, (None, None))
+        if sz1 is None or sz2 is None:
+            continue
+        if sz1 != sz2:
+            unstable.append((fpath, f"size changed: {human_size(sz1)} -> {human_size(sz2)}"))
+        elif mt1 != mt2:
+            unstable.append((fpath, "modification time changed"))
+    # Files that appeared between snapshots
+    for fpath in set(snap2) - set(snap1):
+        unstable.append((fpath, "new file appeared"))
+    return unstable
+
+
+def wait_for_stable_path(path: Path, max_wait: float = 5.0, check_interval: float = 1.0):
+    """Wait until files under path stop changing, or warn and ask user.
+    
+    Returns True if stable (safe to proceed), False if user chose to abort.
+    """
+    unstable = check_path_stability(path, interval=check_interval)
+    if not unstable:
+        return True
+
+    deadline = time.monotonic() + max_wait
+    while unstable and time.monotonic() < deadline:
+        print(f"\n⚠️  Files still being written to:", file=sys.stderr)
+        for fp, reason in unstable[:5]:
+            print(f"  - {Path(fp).name}: {reason}", file=sys.stderr)
+        if len(unstable) > 5:
+            print(f"  ... and {len(unstable) - 5} more", file=sys.stderr)
+        remaining = int(deadline - time.monotonic())
+        print(f"Waiting for files to stabilize ({remaining}s remaining)...", file=sys.stderr)
+        unstable = check_path_stability(path, interval=min(check_interval * 2, 3.0))
+
+    if not unstable:
+        print("Files stabilized.", file=sys.stderr)
+        return True
+
+    # Still unstable after max_wait
+    print(f"\n⚠️  Some files are still being written to after {max_wait:.0f}s:", file=sys.stderr)
+    for fp, reason in unstable[:5]:
+        print(f"  - {Path(fp).name}: {reason}", file=sys.stderr)
+    try:
+        response = input("Proceed anyway? [y/N] ").strip().lower()
+        return response in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        print("\nAborted.", file=sys.stderr)
+        return False
+
+
+def safe_tar_add(tar: tarfile.TarFile, filepath: str, arcname: str):
+    """Add a file to tar, handling errors for files that change during read."""
+    try:
+        tar.add(filepath, arcname=arcname)
+    except (OSError, IOError, tarfile.TarError) as e:
+        logger.warning(f"Skipped file {filepath}: {e}")
+        print(f"  ⚠️  Skipped: {Path(filepath).name} ({e})", file=sys.stderr)
+
+
 def compute_sha256(filepath: str) -> str:
     """Compute SHA256 hash of a file."""
     h = hashlib.sha256()
@@ -465,10 +548,19 @@ def collect_file_metadata(paths: list):
         print(f"Compressing directory: {dir_path.name}/ ({file_count} files, {human_size(dir_size)})",
               file=sys.stderr)
 
+        # Check if files are still being written to
+        if not wait_for_stable_path(dir_path):
+            print("Aborted.", file=sys.stderr)
+            sys.exit(1)
+
         tar_fd, tar_path = tempfile.mkstemp(suffix=".tar.gz")
         os.close(tar_fd)
         with tarfile.open(tar_path, "w:gz") as tar:
-            tar.add(str(dir_path), arcname=dir_path.name)
+            # Add files individually so we can handle per-file errors
+            tar.add(str(dir_path), arcname=dir_path.name, recursive=False)
+            for item in sorted(dir_path.rglob("*")):
+                arcname = str(Path(dir_path.name) / item.relative_to(dir_path))
+                safe_tar_add(tar, str(item), arcname)
 
         tar_size = os.path.getsize(tar_path)
         checksum = compute_sha256(tar_path)
@@ -488,11 +580,17 @@ def collect_file_metadata(paths: list):
         multi_size = sum(f.stat().st_size for f in resolved)
         print(f"Bundling {len(resolved)} files ({human_size(multi_size)})", file=sys.stderr)
 
+        # Check stability of each file
+        for rp in resolved:
+            if not wait_for_stable_path(rp):
+                print("Aborted.", file=sys.stderr)
+                sys.exit(1)
+
         tar_fd, tar_path = tempfile.mkstemp(suffix=".tar.gz")
         os.close(tar_fd)
         with tarfile.open(tar_path, "w:gz") as tar:
             for rp in resolved:
-                tar.add(str(rp), arcname=rp.name)
+                safe_tar_add(tar, str(rp), rp.name)
 
         tar_size = os.path.getsize(tar_path)
         checksum = compute_sha256(tar_path)
@@ -511,6 +609,10 @@ def collect_file_metadata(paths: list):
     # Single file
     else:
         fp = resolved[0]
+        # Check if file is still being written to
+        if not wait_for_stable_path(fp):
+            print("Aborted.", file=sys.stderr)
+            sys.exit(1)
         size = fp.stat().st_size
         checksum = compute_sha256(str(fp))
         files_meta.append({
