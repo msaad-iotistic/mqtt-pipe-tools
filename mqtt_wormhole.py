@@ -395,13 +395,24 @@ def wait_for_stable_path(path: Path, max_wait: float = 5.0, check_interval: floa
         return False
 
 
-def safe_tar_add(tar: tarfile.TarFile, filepath: str, arcname: str):
-    """Add a file to tar, handling errors for files that change during read."""
+def safe_tar_add(tar: tarfile.TarFile, filepath: str, arcname: str, timeout: int = 10):
+    """Add a file to tar, handling errors and timeouts for files that may block."""
+    def _alarm_handler(signum, frame):
+        raise TimeoutError(f"Timed out reading {filepath}")
+
+    old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
+    signal.alarm(timeout)
     try:
         tar.add(filepath, arcname=arcname)
+    except TimeoutError:
+        logger.warning(f"Timed out adding {filepath} to archive (>{timeout}s)")
+        print(f"  ⚠️  Skipped (timeout): {Path(filepath).name}", file=sys.stderr)
     except (OSError, IOError, tarfile.TarError) as e:
         logger.warning(f"Skipped file {filepath}: {e}")
         print(f"  ⚠️  Skipped: {Path(filepath).name} ({e})", file=sys.stderr)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
 
 
 def compute_sha256(filepath: str) -> str:
@@ -527,7 +538,7 @@ def recv_control(client: MQTTNetcat, timeout: float = 60, drain_data=None) -> Op
 
 # ─── FILE METADATA ──────────────────────────────────────────────────────────
 
-def collect_file_metadata(paths: list):
+def collect_file_metadata(paths: list, no_archive: bool = False):
     """Collect metadata for files/directories to transfer. Returns (metadata_dict, tar_path_or_None)."""
     files_meta = []
     tar_path = None
@@ -545,17 +556,23 @@ def collect_file_metadata(paths: list):
         dir_path = resolved[0]
         file_count = sum(1 for _ in dir_path.rglob("*") if _.is_file())
         dir_size = sum(f.stat().st_size for f in dir_path.rglob("*") if f.is_file())
-        print(f"Compressing directory: {dir_path.name}/ ({file_count} files, {human_size(dir_size)})",
-              file=sys.stderr)
+        if no_archive:
+            print(f"Archiving directory (no compression): {dir_path.name}/ ({file_count} files, {human_size(dir_size)})",
+                  file=sys.stderr)
+        else:
+            print(f"Compressing directory: {dir_path.name}/ ({file_count} files, {human_size(dir_size)})",
+                  file=sys.stderr)
 
         # Check if files are still being written to
         if not wait_for_stable_path(dir_path):
             print("Aborted.", file=sys.stderr)
             sys.exit(1)
 
-        tar_fd, tar_path = tempfile.mkstemp(suffix=".tar.gz")
+        tar_suffix = ".tar" if no_archive else ".tar.gz"
+        tar_mode = "w:" if no_archive else "w:gz"
+        tar_fd, tar_path = tempfile.mkstemp(suffix=tar_suffix)
         os.close(tar_fd)
-        with tarfile.open(tar_path, "w:gz") as tar:
+        with tarfile.open(tar_path, tar_mode) as tar:
             # Add files individually so we can handle per-file errors
             tar.add(str(dir_path), arcname=dir_path.name, recursive=False)
             for item in sorted(dir_path.rglob("*")):
@@ -564,8 +581,9 @@ def collect_file_metadata(paths: list):
 
         tar_size = os.path.getsize(tar_path)
         checksum = compute_sha256(tar_path)
+        tar_name = f"{dir_path.name}{tar_suffix}"
         files_meta.append({
-            "name": f"{dir_path.name}.tar.gz",
+            "name": tar_name,
             "size": tar_size,
             "checksum": f"sha256:{checksum}",
             "is_archive": True,
@@ -586,16 +604,18 @@ def collect_file_metadata(paths: list):
                 print("Aborted.", file=sys.stderr)
                 sys.exit(1)
 
-        tar_fd, tar_path = tempfile.mkstemp(suffix=".tar.gz")
+        tar_suffix = ".tar" if no_archive else ".tar.gz"
+        tar_mode = "w:" if no_archive else "w:gz"
+        tar_fd, tar_path = tempfile.mkstemp(suffix=tar_suffix)
         os.close(tar_fd)
-        with tarfile.open(tar_path, "w:gz") as tar:
+        with tarfile.open(tar_path, tar_mode) as tar:
             for rp in resolved:
                 safe_tar_add(tar, str(rp), rp.name)
 
         tar_size = os.path.getsize(tar_path)
         checksum = compute_sha256(tar_path)
         files_meta.append({
-            "name": "bundle.tar.gz",
+            "name": f"bundle{tar_suffix}",
             "size": tar_size,
             "checksum": f"sha256:{checksum}",
             "is_archive": True,
@@ -671,7 +691,7 @@ def do_send(args, env_config: dict):
         logger.info(f"Auto-encryption enabled (window: {enc_config['key_window']}s)")
 
     # Collect file metadata and prepare tarball if needed
-    metadata, tar_path = collect_file_metadata(args.files)
+    metadata, tar_path = collect_file_metadata(args.files, no_archive=args.no_archive)
     total_size = metadata["total_size"]
     send_path = tar_path if tar_path else str(Path(args.files[0]).resolve())
     logger.info(f"Prepared files: {metadata['file_count']} file(s), total size: {human_size(total_size)}")
@@ -1208,10 +1228,11 @@ def do_receive(args, env_config: dict):
                 f.write(block)
 
         # Extract archive if needed
-        if file_info.get("is_archive") and str(out_file).endswith(".tar.gz"):
+        if file_info.get("is_archive") and (str(out_file).endswith(".tar.gz") or str(out_file).endswith(".tar")):
             print("Extracting archive...", file=sys.stderr)
             try:
-                with tarfile.open(str(out_file), "r:gz") as tar:
+                tar_mode = "r:gz" if str(out_file).endswith(".tar.gz") else "r:"
+                with tarfile.open(str(out_file), tar_mode) as tar:
                     tar.extractall(path=str(output_dir))
                 os.unlink(str(out_file))
                 if transfer_type == "directory":
@@ -1301,6 +1322,7 @@ def build_parser() -> argparse.ArgumentParser:
     xfer_group.add_argument("--qos", type=int, choices=[0, 1, 2], default=None, help="QoS level (default: 1)")
     xfer_group.add_argument("--chunk-size", type=int, default=None, help="Chunk size in bytes (default: 65536)")
     xfer_group.add_argument("--compress", choices=list(COMPRESSION_TYPES.keys()), default=None, help="Compression")
+    xfer_group.add_argument("--no-archive", action="store_true", help="Skip gzip compression when archiving directories (use plain tar, faster for large/active dirs)")
     xfer_group.add_argument("--force-overwrite", action="store_true", help="Automatically overwrite existing files without confirmation (bypasses overwrite/rename prompt)")
 
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
