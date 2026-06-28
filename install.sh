@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# install.sh - Install mqtt-wormhole and mqtt-cat globally
+# install.sh - Install mqtt-wormhole, mqtt-cat, and mqtt-forward globally
 #
 # Usage:
 #   ./install.sh           # Install for current user
@@ -23,6 +23,7 @@ NC='\033[0m' # No Color
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORMHOLE_SCRIPT="$SCRIPT_DIR/mqtt_wormhole.py"
 MQTTCAT_SCRIPT="$SCRIPT_DIR/mqtt_cat.py"
+FORWARD_SCRIPT="$SCRIPT_DIR/mqtt_forward.py"
 REQUIREMENTS="$SCRIPT_DIR/requirements.txt"
 VENV_DIR="$SCRIPT_DIR/venv"
 
@@ -32,6 +33,7 @@ SYSTEM_PYTHON="/opt/iotistic-mnvr/mnvrenv/bin/python"
 # Target command names
 WORMHOLE_CMD="mqtt-wormhole"
 MQTTCAT_CMD="mqtt-cat"
+FORWARD_CMD="mqtt-forward"
 
 # Will be set during install
 PYTHON_BIN=""
@@ -187,12 +189,17 @@ check_scripts_exist() {
         print_error "mqtt_cat.py not found at: $MQTTCAT_SCRIPT"
         missing=1
     fi
+    if [ ! -f "$FORWARD_SCRIPT" ]; then
+        print_error "mqtt_forward.py not found at: $FORWARD_SCRIPT"
+        missing=1
+    fi
     return $missing
 }
 
 make_executable() {
     chmod +x "$WORMHOLE_SCRIPT" 2>/dev/null && print_success "Made mqtt_wormhole.py executable"
     chmod +x "$MQTTCAT_SCRIPT" 2>/dev/null && print_success "Made mqtt_cat.py executable"
+    chmod +x "$FORWARD_SCRIPT" 2>/dev/null && print_success "Made mqtt_forward.py executable"
 }
 
 create_wrapper() {
@@ -253,6 +260,13 @@ verify_installation() {
         success=1
     fi
 
+    if command -v "$FORWARD_CMD" &>/dev/null; then
+        print_success "mqtt-forward installed at: $(command -v "$FORWARD_CMD")"
+    else
+        print_warning "mqtt-forward not found in PATH (may need to restart shell)"
+        success=1
+    fi
+
     return $success
 }
 
@@ -304,6 +318,7 @@ do_install() {
     echo ""
     create_wrapper "$PYTHON_BIN" "$WORMHOLE_SCRIPT" "$bin_dir/$WORMHOLE_CMD" "$WORMHOLE_CMD"
     create_wrapper "$PYTHON_BIN" "$MQTTCAT_SCRIPT" "$bin_dir/$MQTTCAT_CMD" "$MQTTCAT_CMD"
+    create_wrapper "$PYTHON_BIN" "$FORWARD_SCRIPT" "$bin_dir/$FORWARD_CMD" "$FORWARD_CMD"
 
     # Verify
     verify_installation
@@ -319,8 +334,10 @@ do_install() {
     echo -e "  ${BOLD}mqtt-wormhole myfile.pdf${NC}              # Send a file"
     echo -e "  ${BOLD}mqtt-wormhole --code 7-cosmic-dolphin${NC} # Receive a file"
     echo -e "  ${BOLD}mqtt-cat listen prefix profiles.json profile${NC}"
+    echo -e "  ${BOLD}mqtt-forward --listen :8080${NC}           # Forward TCP over MQTT (server)"
+    echo -e "  ${BOLD}mqtt-forward --connect host:22 --code 42-cosmic-dolphin${NC}  # (client)"
     echo ""
-    echo "Run 'mqtt-wormhole --help' for usage information."
+    echo "Run 'mqtt-wormhole --help' or 'mqtt-forward --help' for usage information."
     echo ""
 }
 
@@ -331,7 +348,7 @@ find_commands() {
     local found=()
 
     for dir in "${locations[@]}"; do
-        if [ -e "$dir/$WORMHOLE_CMD" ] || [ -e "$dir/$MQTTCAT_CMD" ]; then
+        if [ -e "$dir/$WORMHOLE_CMD" ] || [ -e "$dir/$MQTTCAT_CMD" ] || [ -e "$dir/$FORWARD_CMD" ]; then
             found+=("$dir")
         fi
     done
@@ -380,6 +397,15 @@ do_uninstall() {
                 print_error "Failed to remove: $dir/$MQTTCAT_CMD (try with sudo)"
             fi
         fi
+
+        if [ -e "$dir/$FORWARD_CMD" ]; then
+            if rm -f "$dir/$FORWARD_CMD" 2>/dev/null; then
+                print_success "Removed: $dir/$FORWARD_CMD"
+                ((removed++))
+            else
+                print_error "Failed to remove: $dir/$FORWARD_CMD (try with sudo)"
+            fi
+        fi
     done
 
     echo ""
@@ -396,7 +422,7 @@ do_uninstall() {
 show_help() {
     echo "Usage: $0 [OPTIONS]"
     echo ""
-    echo "Install mqtt-wormhole and mqtt-cat commands globally."
+    echo "Install mqtt-wormhole, mqtt-cat, and mqtt-forward commands globally."
     echo ""
     echo "Options:"
     echo "  --uninstall    Remove installed commands"
