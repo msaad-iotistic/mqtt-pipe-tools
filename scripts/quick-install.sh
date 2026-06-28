@@ -100,10 +100,11 @@ if [ -d "$INSTALL_DIR" ]; then
     if [ -d "$INSTALL_DIR/.git" ]; then
         print_info "Updating repository at $INSTALL_DIR..."
         cd "$INSTALL_DIR"
-        if git pull; then
+        if git fetch origin 2>/dev/null && git reset --hard origin/main 2>/dev/null; then
             print_success "Repository updated"
         else
-            print_warning "git pull failed, continuing with existing version"
+            print_error "Failed to update repository — cannot proceed"
+            exit 1
         fi
     else
         print_warning "Directory exists but is not a git repository"
@@ -205,4 +206,5 @@ echo -e "Installation location: ${BOLD}$INSTALL_DIR${NC}"
 echo ""
 echo "To get started:"
 echo -e "  ${BOLD}mqtt-wormhole --help${NC}"
+echo -e "  ${BOLD}mqtt-forward --help${NC}"
 echo ""
