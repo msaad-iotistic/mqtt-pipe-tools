@@ -89,44 +89,34 @@ class Compressor:
         self._local = threading.local()
 
     def compress(self, data: bytes) -> bytes:
-        """Compress data based on configured compression type"""
+        """Compress data based on configured compression type.
+
+        Each message is compressed independently (a complete zlib stream per
+        message). A stateful/streaming deflate context cannot survive the
+        loss, reordering or duplicate delivery that MQTT permits: one bad
+        message would desync the shared stream and corrupt/truncate every
+        message after it. Per-message compression keeps each chunk decodable
+        on its own.
+        """
         if self.compression_type == COMPRESSION_NONE or not data:
             return data
 
-        # Initialize thread-local compressor if needed
-        if not hasattr(self._local, "compressor"):
-            if self.compression_type == COMPRESSION_DEFLATE:
-                self._local.compressor = zlib.compressobj(self.level)
-            else:
-                return data
-
-        # Compress the data
         try:
             if self.compression_type == COMPRESSION_DEFLATE:
-                compressed = self._local.compressor.compress(data)
-                compressed += self._local.compressor.flush(zlib.Z_SYNC_FLUSH)
-                return compressed
+                return zlib.compress(data, self.level)
         except Exception as e:
             raise RuntimeError(f"Compression failed: {str(e)}")
 
         return data
 
     def decompress(self, data: bytes) -> bytes:
-        """Decompress data based on configured compression type"""
+        """Decompress a single, independently-compressed message."""
         if self.compression_type == COMPRESSION_NONE or not data:
             return data
 
-        # Initialize thread-local decompressor if needed
-        if not hasattr(self._local, "decompressor"):
-            if self.compression_type == COMPRESSION_DEFLATE:
-                self._local.decompressor = zlib.decompressobj()
-            else:
-                return data
-
-        # Decompress the data
         try:
             if self.compression_type == COMPRESSION_DEFLATE:
-                return self._local.decompressor.decompress(data)
+                return zlib.decompress(data)
         except Exception as e:
             raise RuntimeError(f"Decompression failed: {str(e)}")
 
