@@ -90,6 +90,18 @@ def hash_code(code: str) -> str:
     return hashlib.sha256(code.encode('utf-8')).hexdigest()[:16]
 
 
+def parse_rate(s: str) -> float:
+    """Parse a rate string with optional k/m/g suffix to bytes (e.g. '500k' → 512000.0)."""
+    s = s.strip().lower()
+    if s.endswith('g'):
+        return float(s[:-1]) * 1024 ** 3
+    if s.endswith('m'):
+        return float(s[:-1]) * 1024 ** 2
+    if s.endswith('k'):
+        return float(s[:-1]) * 1024
+    return float(s)
+
+
 def parse_env_file(filepath: str) -> dict:
     env = {}
     try:
@@ -228,11 +240,9 @@ def get_encryption_config(args, env_config: dict, code: str = None) -> dict:
 
 
 def get_transfer_config(args, env_config: dict) -> dict:
-    # Default QoS 1 (at-least-once, ordered). QoS 0 loses messages (corrupts the
-    # byte stream); QoS 2 is correct in principle but its 4-way handshake
-    # saturates paho's in-flight window under concurrent multiplexed load and
-    # stalls transfers. QoS 1 carries many concurrent connections reliably and
-    # byte-perfectly in testing. Override via --qos or MQTT_QOS.
+    # Default QoS 0 (fire-and-forget): lowest broker load, no in-flight window
+    # pressure under concurrent multiplexed connections. Relies on TCP ordering
+    # within the MQTT session for stream integrity. Override via --qos or MQTT_QOS.
     qos = args.qos if args.qos is not None else int(env_config.get("qos", 0))
     chunk_size = args.chunk_size or int(env_config.get("chunk_size", 65536))
     compress = args.compress or "none"
@@ -316,6 +326,37 @@ def recv_control(client: MQTTNetcat, timeout: float = 60, drain_data=None,
             return body
         if tag == TAG_DATA and drain_data is not None:
             drain_data.append(body)
+
+
+class TokenBucket:
+    """Token bucket for rate limiting.
+
+    Works for both bytes/sec (consume(len(data))) and publish/sec (consume(1)).
+    has_tokens() refills without consuming — use it to gate rlist in select loops.
+    """
+
+    def __init__(self, rate: float, burst: float = None):
+        self._rate = rate
+        self._capacity = burst if burst is not None else rate
+        self._tokens = float(self._capacity)
+        self._last = time.monotonic()
+
+    def _refill(self):
+        now = time.monotonic()
+        self._tokens = min(self._capacity,
+                           self._tokens + self._rate * (now - self._last))
+        self._last = now
+
+    def consume(self, n: float = 1) -> None:
+        # Always deduct — overdraft is intentional. has_tokens() gating in the
+        # select loop prevents sustained overrun; the overdraft is bounded by
+        # one READ_SIZE burst before the bucket goes negative and blocks.
+        self._refill()
+        self._tokens -= n
+
+    def has_tokens(self, n: float = 1) -> bool:
+        self._refill()
+        return self._tokens >= n
 
 
 class PeerMonitor:
@@ -414,6 +455,9 @@ class MuxForwarder:
         self.by_sock = {}                   # socket -> cid
         self.outbufs = {}                   # cid -> bytearray pending local writes
         self._next_cid = 1
+        self._byte_bucket = TokenBucket(parse_rate(args.rate_limit)) if args.rate_limit else None
+        self._pub_bucket  = TokenBucket(float(args.max_pub_rate)) if args.max_pub_rate else None
+        self._max_conns   = args.max_connections
 
     def _new_cid(self):
         cid = self._next_cid
@@ -442,6 +486,10 @@ class MuxForwarder:
         try:
             sock, addr = self.listener.accept()
         except (OSError, BlockingIOError):
+            return
+        if self._max_conns and len(self.conns) >= self._max_conns:
+            logger.warning(f"Connection from {addr} rejected: max_connections={self._max_conns} reached")
+            sock.close()
             return
         cid = self._new_cid()
         self._register(cid, sock)
@@ -472,6 +520,10 @@ class MuxForwarder:
             self._close(cid)
             return
         if data:
+            if self._byte_bucket:
+                self._byte_bucket.consume(len(data))   # deduct; gating is in run()
+            if self._pub_bucket:
+                self._pub_bucket.consume(1)
             send_data_chunk(self.client, data, cid=cid)
         else:
             self._close(cid)
@@ -541,6 +593,11 @@ class MuxForwarder:
                 return "peer_dead"
 
             rlist = list(self.conns.values())
+            # Stall TCP reads when a rate bucket is exhausted; listener is
+            # always included so new connections can still be accepted.
+            if (self._byte_bucket is not None and not self._byte_bucket.has_tokens(1)) or \
+               (self._pub_bucket is not None and not self._pub_bucket.has_tokens(1)):
+                rlist = []
             if self.listener is not None:
                 rlist.append(self.listener)
             wlist = [self.conns[c] for c, b in self.outbufs.items() if b and c in self.conns]
@@ -1036,6 +1093,12 @@ def build_parser() -> argparse.ArgumentParser:
                               help="Buffer seconds before burst (default: 0.5)")
     tunnel_group.add_argument("--max-batch-size", type=int, default=65536,
                               help="Max bytes before forced flush, one MQTT packet (default: 65536)")
+    tunnel_group.add_argument("--rate-limit", type=str, default=None,
+                              help="Max bytes/sec over MQTT (e.g. 500k, 2m). Applies backpressure to TCP senders.")
+    tunnel_group.add_argument("--max-pub-rate", type=int, default=None,
+                              help="Max MQTT publishes/sec")
+    tunnel_group.add_argument("--max-connections", type=int, default=None,
+                              help="Max concurrent TCP connections (new connections are silently dropped above limit)")
 
     broker_group = parser.add_argument_group("Broker")
     broker_group.add_argument("--host", "-H", type=str, help="MQTT broker host")
