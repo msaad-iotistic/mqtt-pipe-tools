@@ -228,6 +228,11 @@ def get_encryption_config(args, env_config: dict, code: str = None) -> dict:
 
 
 def get_transfer_config(args, env_config: dict) -> dict:
+    # Default QoS 1 (at-least-once, ordered). QoS 0 loses messages (corrupts the
+    # byte stream); QoS 2 is correct in principle but its 4-way handshake
+    # saturates paho's in-flight window under concurrent multiplexed load and
+    # stalls transfers. QoS 1 carries many concurrent connections reliably and
+    # byte-perfectly in testing. Override via --qos or MQTT_QOS.
     qos = args.qos if args.qos is not None else int(env_config.get("qos", 0))
     chunk_size = args.chunk_size or int(env_config.get("chunk_size", 65536))
     compress = args.compress or "none"
@@ -260,8 +265,10 @@ def send_control(client: MQTTNetcat, msg_type: str, payload: dict = None):
     client.send(data)
 
 
-def send_data_chunk(client: MQTTNetcat, chunk: bytes):
-    client.send(bytes([TAG_DATA]) + chunk)
+def send_data_chunk(client: MQTTNetcat, chunk: bytes, cid: int = 0):
+    # Frame: [TAG_DATA][cid:4 big-endian][payload]. cid multiplexes many
+    # concurrent connections over the single MQTT topic pair.
+    client.send(bytes([TAG_DATA]) + cid.to_bytes(4, "big") + chunk)
 
 
 def recv_message(client: MQTTNetcat, timeout: float = 60, monitor: "PeerMonitor" = None):
@@ -287,7 +294,12 @@ def recv_message(client: MQTTNetcat, timeout: float = 60, monitor: "PeerMonitor"
             return None, None
         return TAG_CONTROL, msg
     elif tag == TAG_DATA:
-        return TAG_DATA, body
+        # Returns (cid, payload). Older single-stream frames have no cid; if the
+        # body is shorter than the 4-byte header treat it as cid 0.
+        if len(body) >= 4:
+            cid = int.from_bytes(body[:4], "big")
+            return TAG_DATA, (cid, body[4:])
+        return TAG_DATA, (0, body)
     else:
         return None, None
 
@@ -374,6 +386,184 @@ class BufferBurstSender:
 
     def __bool__(self):
         return len(self._buf) > 0
+
+
+class MuxForwarder:
+    """Multiplex many concurrent TCP connections over one MQTT topic pair.
+
+    Each connection is keyed by a 4-byte cid carried in every TAG_DATA frame and
+    in the CONNECTED/DISCONNECT/ERROR control messages. A single select() loop
+    services the local listener (client mode), every live connection socket, and
+    the inbound MQTT queue — so a browser's parallel requests are carried
+    simultaneously instead of one-at-a-time. Returns a reason string when the
+    session ends so the caller can reconnect/reset exactly as before.
+    """
+
+    READ_SIZE = 65536
+
+    def __init__(self, client, monitor, args, *, listener=None,
+                 connect_addr=None, session_id=None, owner_sid=None):
+        self.client = client
+        self.monitor = monitor
+        self.args = args
+        self.listener = listener            # client (listen) mode
+        self.connect_addr = connect_addr    # server (connect) mode
+        self.session_id = session_id
+        self.owner_sid = owner_sid
+        self.conns = {}                     # cid -> socket
+        self.by_sock = {}                   # socket -> cid
+        self.outbufs = {}                   # cid -> bytearray pending local writes
+        self._next_cid = 1
+
+    def _new_cid(self):
+        cid = self._next_cid
+        self._next_cid += 1
+        return cid
+
+    def _register(self, cid, sock):
+        sock.setblocking(False)
+        self.conns[cid] = sock
+        self.by_sock[sock] = cid
+        self.outbufs[cid] = bytearray()
+
+    def _close(self, cid, notify=True):
+        sock = self.conns.pop(cid, None)
+        self.outbufs.pop(cid, None)
+        if sock is not None:
+            self.by_sock.pop(sock, None)
+            try:
+                sock.close()
+            except Exception:
+                pass
+        if notify:
+            send_control(self.client, MSG_DISCONNECT, {"cid": cid})
+
+    def _accept(self):
+        try:
+            sock, addr = self.listener.accept()
+        except (OSError, BlockingIOError):
+            return
+        cid = self._new_cid()
+        self._register(cid, sock)
+        logger.info(f"Local connection cid={cid} from {addr}")
+        send_control(self.client, MSG_CONNECTED, {"sid": self.session_id, "cid": cid})
+
+    def _open_remote(self, cid):
+        host, port = self.connect_addr
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(10)
+            sock.connect((host, port))
+            self._register(cid, sock)
+            logger.info(f"Opened remote connection cid={cid} to {host}:{port}")
+        except (OSError, socket.timeout) as e:
+            logger.warning(f"cid={cid} connect to {host}:{port} failed: {e}")
+            send_control(self.client, MSG_DISCONNECT, {"cid": cid})
+
+    def _read_local(self, sock):
+        cid = self.by_sock.get(sock)
+        if cid is None:
+            return
+        try:
+            data = sock.recv(self.READ_SIZE)
+        except (BlockingIOError, InterruptedError):
+            return
+        except (OSError, ConnectionError):
+            self._close(cid)
+            return
+        if data:
+            send_data_chunk(self.client, data, cid=cid)
+        else:
+            self._close(cid)
+
+    def _queue_write(self, cid, payload):
+        sock = self.conns.get(cid)
+        if sock is None:
+            return
+        buf = self.outbufs[cid]
+        buf.extend(payload)
+        self._flush(sock)
+
+    def _flush(self, sock):
+        cid = self.by_sock.get(sock)
+        if cid is None:
+            return
+        buf = self.outbufs.get(cid)
+        if not buf:
+            return
+        try:
+            sent = sock.send(buf)
+            del buf[:sent]
+        except (BlockingIOError, InterruptedError):
+            pass
+        except (OSError, ConnectionError):
+            self._close(cid)
+
+    def _drain_mqtt(self):
+        """Process all queued inbound MQTT messages. Returns False if the
+        session has ended (BYE)."""
+        while True:
+            tag, body = recv_message(self.client, timeout=0, monitor=self.monitor)
+            if tag is None:
+                return True
+            if tag == TAG_DATA:
+                cid, payload = body
+                if payload:
+                    self._queue_write(cid, payload)
+            elif tag == TAG_CONTROL and isinstance(body, dict):
+                btype = body.get("type")
+                cid = body.get("cid")
+                if btype == MSG_CONNECTED and self.connect_addr is not None:
+                    if self.owner_sid is None or body.get("sid") == self.owner_sid:
+                        if cid is not None and cid not in self.conns:
+                            self._open_remote(cid)
+                elif btype == MSG_DISCONNECT:
+                    if cid is not None:
+                        self._close(cid, notify=False)
+                elif btype == MSG_ERROR:
+                    if cid is not None:
+                        self._close(cid, notify=False)
+                    else:
+                        logger.warning(f"Peer error: {body.get('message', 'unknown')}")
+                elif btype == MSG_READY and self.connect_addr is not None \
+                        and self.owner_sid is not None and body.get("sid") != self.owner_sid:
+                    send_control(self.client, MSG_BUSY, {"sid": body.get("sid")})
+                elif btype == MSG_BYE:
+                    return False
+
+    def run(self):
+        """Service connections until the session ends. Returns a reason."""
+        while True:
+            if self.client.userdata.get("disconnected") is not None:
+                return "mqtt_lost"
+            self.monitor.maybe_ping()
+            if self.monitor.is_peer_dead():
+                return "peer_dead"
+
+            rlist = list(self.conns.values())
+            if self.listener is not None:
+                rlist.append(self.listener)
+            wlist = [self.conns[c] for c, b in self.outbufs.items() if b and c in self.conns]
+            try:
+                readable, writable, _ = select.select(rlist, wlist, [], 0.1)
+            except (select.error, OSError, ValueError):
+                readable, writable = [], []
+
+            if self.listener is not None and self.listener in readable:
+                self._accept()
+                readable = [s for s in readable if s is not self.listener]
+
+            for sock in readable:
+                self._read_local(sock)
+            for sock in writable:
+                self._flush(sock)
+
+            if not self._drain_mqtt():
+                return "session_ended"
+
+    def close_all(self):
+        for cid in list(self.conns):
+            self._close(cid, notify=False)
 
 
 # ─── AUTHENTICATION ─────────────────────────────────────────────────────────
@@ -601,7 +791,25 @@ def do_server(args, env_config: dict):
                 authenticated = True
                 owner_sid = msg_sid
                 monitor.reset()
-                print("Waiting for client to open local port...", file=sys.stderr)
+                print("Ready. Forwarding connections (multiplexed)...", file=sys.stderr)
+                logger.info("Entering multiplexed forwarding")
+
+                mux = MuxForwarder(client, monitor, args,
+                                   connect_addr=(remote_host, remote_port),
+                                   owner_sid=owner_sid)
+                try:
+                    reason = mux.run()
+                finally:
+                    mux.close_all()
+
+                authenticated = False
+                owner_sid = None
+                if reason == "mqtt_lost":
+                    print("\nMQTT connection lost.", file=sys.stderr)
+                    break
+                print(f"\nSession ended ({reason}). Waiting for client to connect...",
+                      file=sys.stderr)
+                logger.info(f"Session ended ({reason}), waiting for new client")
                 continue
 
             # ── Owner gracefully leaving ──
@@ -618,125 +826,8 @@ def do_server(args, env_config: dict):
             if not authenticated or (msg_sid is not None and msg_sid != owner_sid):
                 continue
 
-            if mtype != MSG_CONNECTED:
-                continue
-
-            # ── Owner opened a local connection: connect to remote and forward ──
-            print("Client ready, connecting to remote service...", file=sys.stderr)
-            logger.info("Client has local TCP connection")
-
-            tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            tcp_sock.settimeout(10)
-            try:
-                tcp_sock.connect((remote_host, remote_port))
-                tcp_sock.setblocking(False)
-                print(f"Connected to {remote_host}:{remote_port}", file=sys.stderr)
-                logger.info(f"Connected to remote service {remote_host}:{remote_port}")
-            except (OSError, socket.timeout) as e:
-                print(f"Error: Could not connect to {remote_host}:{remote_port}: {e}", file=sys.stderr)
-                send_control(client, MSG_ERROR, {"message": str(e)})
-                tcp_sock.close()
-                tcp_sock = None
-                continue
-
-            # Bidirectional forwarding loop
-            sender = BufferBurstSender(client, batch_sec=args.batch_sec, max_batch_size=args.max_batch_size)
-            print("Tunnel established. Forwarding...", file=sys.stderr)
-            logger.info("Tunnel established, starting forwarding loop")
-
-            mqtt_lost = False
-            session_ended = False
-            while True:
-                if client.userdata.get("disconnected") is not None:
-                    print("\nMQTT connection lost.", file=sys.stderr)
-                    logger.warning("MQTT disconnected, exiting")
-                    mqtt_lost = True
-                    break
-
-                monitor.maybe_ping()
-                if monitor.is_peer_dead():
-                    print("\nClient timed out (no heartbeat).", file=sys.stderr)
-                    logger.warning("Client heartbeat timeout during forwarding")
-                    session_ended = True
-                    break
-
-                try:
-                    rlist, _, _ = select.select([tcp_sock], [], [], 0.1)
-                except (select.error, OSError):
-                    break
-
-                # TCP → MQTT
-                if tcp_sock in rlist:
-                    try:
-                        data = tcp_sock.recv(65536)
-                        if data:
-                            sender.write(data)
-                        else:
-                            print("\nRemote service disconnected.", file=sys.stderr)
-                            logger.info("Remote service disconnected")
-                            sender.flush()
-                            send_control(client, MSG_DISCONNECT)
-                            break
-                    except (OSError, ConnectionError):
-                        break
-
-                sender.check_timeout()
-
-                # MQTT → TCP
-                inner_break = False
-                while True:
-                    tag, body = recv_message(client, timeout=0, monitor=monitor)
-                    if tag is None:
-                        break
-                    if tag == TAG_DATA and body:
-                        try:
-                            tcp_sock.sendall(body)
-                        except (OSError, ConnectionError):
-                            inner_break = True
-                            break
-                    elif tag == TAG_CONTROL and isinstance(body, dict):
-                        btype = body.get("type")
-                        if btype == MSG_DISCONNECT:
-                            print("\nLocal client disconnected.", file=sys.stderr)
-                            logger.info("Local client disconnected")
-                            inner_break = True
-                            break
-                        elif btype == MSG_BYE and body.get("sid") == owner_sid:
-                            print("\nClient disconnected. Freeing session.", file=sys.stderr)
-                            logger.info("Owner client said BYE during forwarding")
-                            session_ended = True
-                            inner_break = True
-                            break
-                        elif btype == MSG_READY and body.get("sid") != owner_sid:
-                            # Another client tried to attach mid-session → reject
-                            logger.info(f"Rejecting client {body.get('sid')}: session busy")
-                            send_control(client, MSG_BUSY, {"sid": body.get("sid")})
-                        elif btype == MSG_ERROR:
-                            print(f"\nClient error: {body.get('message', 'unknown')}", file=sys.stderr)
-                            inner_break = True
-                            break
-                if inner_break:
-                    break
-
-            # Close current remote connection
-            try:
-                tcp_sock.close()
-            except Exception:
-                pass
-            tcp_sock = None
-
-            if mqtt_lost:
-                break
-
-            if session_ended:
-                authenticated = False
-                owner_sid = None
-                print("\nSession ended. Waiting for client to connect...", file=sys.stderr)
-                logger.info("Session ended, waiting for new client")
-                continue
-
-            print("\nConnection closed. Waiting for next local connection...", file=sys.stderr)
-            logger.info("Connection closed, waiting for next")
+            # MSG_CONNECTED and data are handled inside MuxForwarder; nothing
+            # else to do in the session loop.
 
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
@@ -881,142 +972,32 @@ def do_client(args, env_config: dict):
                 tcp_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 tcp_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 tcp_listener.bind((listen_host, listen_port))
-                tcp_listener.listen(1)
+                tcp_listener.listen(128)
                 tcp_listener.setblocking(False)
                 logger.info(f"TCP listener bound to {listen_host}:{listen_port}")
                 print(f"Listening on {listen_host}:{listen_port}, waiting for local connection...", file=sys.stderr)
                 connected = True  # Exit the auth loop, enter the persistent forwarding loop
 
-        # Outer loop: accept multiple sequential local connections
-        while True:
-            if client.userdata.get("disconnected") is not None:
-                print("\nMQTT connection lost.", file=sys.stderr)
-                break
+        # Multiplexed forwarding: accept and carry many concurrent local
+        # connections simultaneously over the single MQTT channel.
+        print("Tunnel ready. Forwarding (multiplexed)...", file=sys.stderr)
+        logger.info("Entering multiplexed forwarding")
+        mux = MuxForwarder(client, monitor, args,
+                           listener=tcp_listener, session_id=session_id)
+        try:
+            reason = mux.run()
+        finally:
+            mux.close_all()
 
-            # Wait for a local TCP connection
-            tcp_conn = None
-            while tcp_conn is None:
-                if client.userdata.get("disconnected") is not None:
-                    print("\nMQTT connection lost.", file=sys.stderr)
-                    cleanup()
-                    return
-
-                # Keep heartbeat alive and watch for the server going away
-                monitor.maybe_ping()
-                if monitor.is_peer_dead():
-                    print("\nServer timed out (no heartbeat).", file=sys.stderr)
-                    logger.warning("Server heartbeat timeout while idle")
-                    cleanup()
-                    return
-                ctl = recv_control(client, timeout=0.2, monitor=monitor)
-                if ctl is not None and ctl.get("type") == MSG_BYE:
-                    print("\nServer disconnected.", file=sys.stderr)
-                    logger.info("Server said BYE while idle")
-                    cleanup()
-                    return
-
-                try:
-                    rlist, _, _ = select.select([tcp_listener], [], [], 0.2)
-                    if tcp_listener in rlist:
-                        tcp_conn, addr = tcp_listener.accept()
-                        tcp_conn.setblocking(False)
-                        print(f"Local TCP client connected from {addr}", file=sys.stderr)
-                        logger.info(f"Local TCP client connected from {addr}")
-                        send_control(client, MSG_CONNECTED, {"sid": session_id})
-                except (select.error, OSError):
-                    pass
-
-            # Bidirectional forwarding loop
-            sender = BufferBurstSender(client, batch_sec=args.batch_sec, max_batch_size=args.max_batch_size)
-            print("Tunnel established. Forwarding...", file=sys.stderr)
-            logger.info("Tunnel established, starting forwarding loop")
-
-            mqtt_lost = False
-            server_gone = False
-            while True:
-                if client.userdata.get("disconnected") is not None:
-                    print("\nMQTT connection lost.", file=sys.stderr)
-                    logger.warning("MQTT disconnected, exiting")
-                    mqtt_lost = True
-                    break
-
-                monitor.maybe_ping()
-                if monitor.is_peer_dead():
-                    print("\nServer timed out (no heartbeat).", file=sys.stderr)
-                    logger.warning("Server heartbeat timeout during forwarding")
-                    server_gone = True
-                    break
-
-                try:
-                    rlist, _, _ = select.select([tcp_conn], [], [], 0.1)
-                except (select.error, OSError):
-                    break
-
-                # TCP → MQTT
-                if tcp_conn in rlist:
-                    try:
-                        data = tcp_conn.recv(65536)
-                        if data:
-                            sender.write(data)
-                        else:
-                            print("\nLocal TCP client disconnected.", file=sys.stderr)
-                            logger.info("Local TCP client disconnected")
-                            sender.flush()
-                            send_control(client, MSG_DISCONNECT)
-                            break
-                    except (OSError, ConnectionError):
-                        break
-
-                sender.check_timeout()
-
-                # MQTT → TCP
-                inner_break = False
-                while True:
-                    tag, body = recv_message(client, timeout=0, monitor=monitor)
-                    if tag is None:
-                        break
-                    if tag == TAG_DATA and body:
-                        try:
-                            tcp_conn.sendall(body)
-                        except (OSError, ConnectionError):
-                            inner_break = True
-                            break
-                    elif tag == TAG_CONTROL and isinstance(body, dict):
-                        btype = body.get("type")
-                        if btype == MSG_DISCONNECT:
-                            print("\nRemote service disconnected.", file=sys.stderr)
-                            logger.info("Remote service disconnected")
-                            inner_break = True
-                            break
-                        elif btype == MSG_BYE:
-                            print("\nServer disconnected.", file=sys.stderr)
-                            logger.info("Server said BYE during forwarding")
-                            server_gone = True
-                            inner_break = True
-                            break
-                        elif btype == MSG_ERROR:
-                            print(f"\nServer error: {body.get('message', 'unknown')}", file=sys.stderr)
-                            inner_break = True
-                            break
-                if inner_break:
-                    break
-
-            # Close current local connection, loop back for next
-            try:
-                tcp_conn.close()
-            except Exception:
-                pass
-            tcp_conn = None
-
-            if mqtt_lost:
-                break
-
-            if server_gone:
-                print("Server is gone. Exiting.", file=sys.stderr)
-                break
-
-            print("\nConnection closed. Waiting for next local connection...", file=sys.stderr)
-            logger.info("Connection closed, waiting for next")
+        if reason == "mqtt_lost":
+            print("\nMQTT connection lost.", file=sys.stderr)
+        elif reason == "peer_dead":
+            print("\nServer timed out (no heartbeat).", file=sys.stderr)
+        else:
+            print("\nServer disconnected.", file=sys.stderr)
+        logger.info(f"Client forwarding ended ({reason})")
+        cleanup()
+        return
 
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
