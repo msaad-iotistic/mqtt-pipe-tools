@@ -395,39 +395,6 @@ class PeerMonitor:
         return (time.monotonic() - self._last_rx) > self._timeout
 
 
-# ─── BUFFER-BURST SENDER ────────────────────────────────────────────────────
-
-class BufferBurstSender:
-    """Buffer data and send as one large MQTT message after batch_sec seconds."""
-
-    def __init__(self, client: MQTTNetcat, batch_sec: float = 2.0, max_batch_size: int = 1048576):
-        self._client = client
-        self._batch_sec = batch_sec
-        self._max_batch_size = max_batch_size
-        self._buf = bytearray()
-        self._first_byte_time: Optional[float] = None
-
-    def write(self, data: bytes):
-        self._buf.extend(data)
-        if self._first_byte_time is None:
-            self._first_byte_time = time.monotonic()
-        if len(self._buf) >= self._max_batch_size:
-            self.flush()
-
-    def check_timeout(self):
-        if self._buf and self._first_byte_time is not None:
-            if time.monotonic() - self._first_byte_time >= self._batch_sec:
-                self.flush()
-
-    def flush(self):
-        if self._buf:
-            send_data_chunk(self._client, bytes(self._buf))
-            self._buf.clear()
-            self._first_byte_time = None
-
-    def __bool__(self):
-        return len(self._buf) > 0
-
 
 class MuxForwarder:
     """Multiplex many concurrent TCP connections over one MQTT topic pair.
@@ -762,7 +729,6 @@ def do_server(args, env_config: dict):
     client = create_client("connect", code, profile, enc_config, transfer_config, verbose=args.verbose)
 
     cleanup_done = False
-    tcp_sock: Optional[socket.socket] = None
 
     def cleanup():
         nonlocal cleanup_done
@@ -775,11 +741,6 @@ def do_server(args, env_config: dict):
             time.sleep(0.2)
         except Exception:
             pass
-        if tcp_sock:
-            try:
-                tcp_sock.close()
-            except Exception:
-                pass
         try:
             client.disconnect()
         except Exception:
@@ -944,7 +905,6 @@ def do_client(args, env_config: dict):
 
     cleanup_done = False
     tcp_listener: Optional[socket.socket] = None
-    tcp_conn: Optional[socket.socket] = None
 
     def cleanup():
         nonlocal cleanup_done
@@ -957,12 +917,11 @@ def do_client(args, env_config: dict):
             time.sleep(0.2)
         except Exception:
             pass
-        for sock in [tcp_conn, tcp_listener]:
-            if sock:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
+        if tcp_listener:
+            try:
+                tcp_listener.close()
+            except Exception:
+                pass
         try:
             client.disconnect()
         except Exception:
@@ -1089,10 +1048,6 @@ def build_parser() -> argparse.ArgumentParser:
                             help="Pairing code (auto-generated for server, required for client)")
 
     tunnel_group = parser.add_argument_group("Tunnel")
-    tunnel_group.add_argument("--batch-sec", type=float, default=0.5,
-                              help="Buffer seconds before burst (default: 0.5)")
-    tunnel_group.add_argument("--max-batch-size", type=int, default=65536,
-                              help="Max bytes before forced flush, one MQTT packet (default: 65536)")
     tunnel_group.add_argument("--rate-limit", type=str, default=None,
                               help="Max bytes/sec over MQTT (e.g. 500k, 2m). Applies backpressure to TCP senders.")
     tunnel_group.add_argument("--max-pub-rate", type=int, default=None,
