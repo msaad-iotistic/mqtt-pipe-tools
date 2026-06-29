@@ -1,0 +1,10 @@
+# Optional dependencies — installed best-effort when pip is available.
+# The tools work without these; they only enhance behavior.
+
+# Strong AES-GCM encryption. Without it, auto-encryption falls back to a pure-stdlib
+# scheme and an explicit --encryption-key is rejected with a clear error.
+# (C extension — cannot be vendored.)
+cryptography
+
+# Nicer file-transfer progress bars. Without it, a simple text progress fallback is used.
+tqdm

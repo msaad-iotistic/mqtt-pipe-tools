@@ -2,6 +2,8 @@
 import argparse
 import base64
 import contextlib
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -9,17 +11,32 @@ import queue
 import select
 import signal
 import ssl
+import struct
 import sys
 import threading
 import time
 import zlib  # Added for compression
 from typing import Any, Callable, Dict, Optional, TypedDict, Union
 
-import paho.mqtt.client as mqtt
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+try:
+    import paho.mqtt.client as mqtt
+except ImportError:
+    # Fall back to the copy vendored under _vendor/ so the tools work without pip.
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "_vendor"))
+    import paho.mqtt.client as mqtt
+
+# cryptography is optional. When present we use AES-GCM; when absent, the Encryptor
+# falls back to a pure-stdlib HMAC-based scheme (auto-encryption only — an explicit
+# user-supplied key requires cryptography and is rejected with a clear error).
+try:
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+    HAVE_CRYPTOGRAPHY = True
+except ImportError:
+    HAVE_CRYPTOGRAPHY = False
 
 # Default configuration
 DEFAULTS = {
@@ -124,61 +141,119 @@ class Compressor:
 
 
 class Encryptor:
-    """Handles AES-GCM encryption/decryption with key derivation and AAD"""
+    """Authenticated encryption with key derivation and AAD.
+
+    Uses AES-GCM when the ``cryptography`` library is available; otherwise falls
+    back to a pure-stdlib scheme (PBKDF2 + HMAC-SHA256 counter-mode keystream with
+    encrypt-then-MAC). The two wire formats are NOT interoperable — both peers must
+    have matching ``cryptography`` availability. A mismatch fails loudly (ValueError
+    on decrypt / authentication failure), never silent corruption.
+
+    The fallback is only ever reached for auto-encryption: explicit user-supplied
+    keys are rejected upstream when ``cryptography`` is missing (see HAVE_CRYPTOGRAPHY
+    gates in _setup_encryption and get_encryption_config).
+    """
+
+    # stdlib-fallback wire format: nonce(16) || tag(32) || ciphertext
+    _FB_NONCE = 16
+    _FB_TAG = 32
 
     def __init__(self, password: Optional[str] = None, salt: bytes = b"", iterations: int = 210000):
         self.key = None
+        self.enc_key = None
+        self.mac_key = None
         if password:
             if len(password) < 32:
                 raise ValueError("Encryption key must be at least 32 characters")
             self.derive_key(password.encode(), salt, iterations)
 
     def __del__(self):
-        """Securely wipe key from memory"""
-        if self.key:
-            # Overwrite key in memory
-            try:
-                for i in range(len(self.key)):
-                    self.key[i : i + 1] = b"\x00"
-            except TypeError:
-                # Key is immutable bytes, we can't modify it
-                pass
-            finally:
-                self.key = None
+        """Securely wipe keys from memory (best-effort)."""
+        for attr in ("key", "enc_key", "mac_key"):
+            val = getattr(self, attr, None)
+            if val:
+                try:
+                    for i in range(len(val)):
+                        val[i : i + 1] = b"\x00"
+                except TypeError:
+                    # Immutable bytes — can't overwrite in place.
+                    pass
+                finally:
+                    setattr(self, attr, None)
 
     def derive_key(self, password: bytes, salt: bytes, iterations: int):
-        """Derive a key from password using PBKDF2"""
-        kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=salt,
-            iterations=iterations,
-            backend=default_backend(),
-        )
-        self.key = kdf.derive(password)
+        """Derive a 32-byte key from the password using PBKDF2-HMAC-SHA256."""
+        if HAVE_CRYPTOGRAPHY:
+            kdf = PBKDF2HMAC(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=salt,
+                iterations=iterations,
+                backend=default_backend(),
+            )
+            self.key = kdf.derive(password)
+        else:
+            self.key = hashlib.pbkdf2_hmac("sha256", password, salt, iterations, 32)
+            # Separate encryption and MAC keys for the fallback (key separation).
+            self.enc_key = hmac.new(self.key, b"mqtt-pipe-enc", hashlib.sha256).digest()
+            self.mac_key = hmac.new(self.key, b"mqtt-pipe-mac", hashlib.sha256).digest()
+
+    def _fb_keystream(self, nonce: bytes, length: int) -> bytes:
+        """HMAC-SHA256 counter-mode keystream of at least ``length`` bytes."""
+        out = bytearray()
+        counter = 0
+        while len(out) < length:
+            out += hmac.new(
+                self.enc_key, nonce + struct.pack(">Q", counter), hashlib.sha256
+            ).digest()
+            counter += 1
+        return bytes(out[:length])
 
     def encrypt(self, plaintext: bytes, aad: bytes) -> bytes:
-        """Encrypt data with AES-GCM using Additional Authenticated Data (AAD)"""
+        """Encrypt data with AAD binding it to the topic."""
         if not self.key:
             return plaintext
 
-        nonce = os.urandom(12)
-        aesgcm = AESGCM(self.key)
-        ciphertext = aesgcm.encrypt(nonce, plaintext, aad)
-        return nonce + ciphertext
+        if HAVE_CRYPTOGRAPHY:
+            nonce = os.urandom(12)
+            aesgcm = AESGCM(self.key)
+            ciphertext = aesgcm.encrypt(nonce, plaintext, aad)
+            return nonce + ciphertext
+
+        nonce = os.urandom(self._FB_NONCE)
+        ciphertext = bytes(
+            p ^ k for p, k in zip(plaintext, self._fb_keystream(nonce, len(plaintext)))
+        )
+        tag = hmac.new(self.mac_key, nonce + ciphertext + aad, hashlib.sha256).digest()
+        return nonce + tag + ciphertext
 
     def decrypt(self, ciphertext: bytes, aad: bytes) -> bytes:
-        """Decrypt data with AES-GCM using Additional Authenticated Data (AAD)"""
-        if not self.key or len(ciphertext) < 12:
-            return ciphertext
+        """Decrypt data, verifying the AAD. Raises ValueError on auth failure."""
+        if HAVE_CRYPTOGRAPHY:
+            if not self.key or len(ciphertext) < 12:
+                return ciphertext
+            nonce = ciphertext[:12]
+            body = ciphertext[12:]
+            aesgcm = AESGCM(self.key)
+            try:
+                return aesgcm.decrypt(nonce, body, aad)
+            except Exception as e:
+                raise ValueError(f"Decryption failed: {str(e)}") from e
 
-        nonce = ciphertext[:12]
-        ciphertext = ciphertext[12:]
-        aesgcm = AESGCM(self.key)
-        try:
-            return aesgcm.decrypt(nonce, ciphertext, aad)
-        except Exception as e:
-            raise ValueError(f"Decryption failed: {str(e)}") from e
+        if not self.key:
+            return ciphertext
+        # Valid fallback output is always >= nonce+tag (empty plaintext -> exactly that).
+        # Anything shorter cannot be ours (e.g. an AES-GCM message from a crypto peer):
+        # fail loudly rather than silently passing the bytes through as "plaintext".
+        if len(ciphertext) < self._FB_NONCE + self._FB_TAG:
+            raise ValueError("Decryption failed: ciphertext too short (scheme mismatch?)")
+        nonce = ciphertext[: self._FB_NONCE]
+        tag = ciphertext[self._FB_NONCE : self._FB_NONCE + self._FB_TAG]
+        body = ciphertext[self._FB_NONCE + self._FB_TAG :]
+        expected = hmac.new(self.mac_key, nonce + body + aad, hashlib.sha256).digest()
+        if not hmac.compare_digest(tag, expected):
+            raise ValueError("Decryption failed: authentication tag mismatch")
+        return bytes(b ^ k for b, k in zip(body, self._fb_keystream(nonce, len(body))))
 
 
 class MQTTNetcat:
@@ -205,6 +280,7 @@ class MQTTNetcat:
         encryption_key: Optional[str] = None,
         encryption_salt: Optional[str] = None,
         encryption_iterations: int = 210000,
+        allow_fallback_encryption: bool = False,
     ):
         """
         Initialize MQTTNetcat instance
@@ -245,6 +321,10 @@ class MQTTNetcat:
         self.encryption_key = encryption_key
         self.encryption_salt = encryption_salt
         self.encryption_iterations = encryption_iterations
+        # When True, an explicit key may use the stdlib fallback if cryptography is
+        # missing. Callers (wormhole/forward) set this only after gating explicit
+        # user-supplied keys, so this stays True for auto-derived keys.
+        self.allow_fallback_encryption = allow_fallback_encryption
 
         # Runtime state
         self.logger = self._setup_logging()
@@ -422,12 +502,24 @@ class MQTTNetcat:
         )
 
         if encryption_key:
+            # An explicit (user-supplied) key requires real AES-GCM. Refuse to
+            # silently downgrade it to the stdlib fallback. Auto-derived keys set
+            # allow_fallback_encryption=True (callers gate explicit keys upstream).
+            if not HAVE_CRYPTOGRAPHY and not self.allow_fallback_encryption:
+                msg = (
+                    "An explicit encryption key requires the 'cryptography' package, "
+                    "which is not installed. Install it (pip install cryptography) or "
+                    "remove the key to use built-in auto-encryption."
+                )
+                self.logger.error(msg)
+                raise RuntimeError(msg)
             try:
                 salt = base64.b64decode(encryption_salt) if encryption_salt else b""
                 self.userdata["encryptor"] = Encryptor(
                     password=encryption_key, salt=salt, iterations=encryption_iterations
                 )
-                self.logger.info("Encryption enabled")
+                backend = "AES-GCM" if HAVE_CRYPTOGRAPHY else "stdlib-fallback"
+                self.logger.info(f"Encryption enabled (backend: {backend})")
                 self.logger.debug(f"Using salt: {base64.b64encode(salt).decode()}")
                 self.logger.debug(f"PBKDF2 iterations: {encryption_iterations}")
             except Exception as e:

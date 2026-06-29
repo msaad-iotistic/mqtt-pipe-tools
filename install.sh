@@ -25,6 +25,7 @@ WORMHOLE_SCRIPT="$SCRIPT_DIR/mqtt_wormhole.py"
 MQTTCAT_SCRIPT="$SCRIPT_DIR/mqtt_cat.py"
 FORWARD_SCRIPT="$SCRIPT_DIR/mqtt_forward.py"
 REQUIREMENTS="$SCRIPT_DIR/requirements.txt"
+OPTIONAL_REQUIREMENTS="$SCRIPT_DIR/requirements-optional.txt"
 VENV_DIR="$SCRIPT_DIR/venv"
 
 # Known system Python environment
@@ -96,15 +97,25 @@ detect_python() {
     fi
 
     print_info "Creating venv at $VENV_DIR ..."
-    $base_python -m venv "$VENV_DIR"
-    PYTHON_BIN="$VENV_DIR/bin/python"
-    print_success "Created venv: $VENV_DIR"
+    # ensurepip is disabled on many minimal/embedded systems, so venv creation may
+    # fail or produce a venv without pip. That's fine: paho-mqtt is vendored, so we
+    # just need a working interpreter. Fall back to the base interpreter if needed.
+    if $base_python -m venv "$VENV_DIR" 2>/dev/null && [ -x "$VENV_DIR/bin/python" ]; then
+        PYTHON_BIN="$VENV_DIR/bin/python"
+        print_success "Created venv: $VENV_DIR"
+    else
+        PYTHON_BIN="$(command -v "$base_python")"
+        print_warning "Could not create a venv (ensurepip likely unavailable)"
+        print_info "Using base interpreter: $PYTHON_BIN (paho-mqtt is vendored, so this is fine)"
+    fi
     return 0
 }
 
 install_dependencies() {
-    if [ ! -f "$REQUIREMENTS" ]; then
-        print_warning "requirements.txt not found, skipping dependencies"
+    # Core dependency (paho-mqtt) is vendored under _vendor/, so nothing is required
+    # here. Optional packages (cryptography, tqdm) are installed best-effort only —
+    # a missing pip or failed install never fails the installer.
+    if [ ! -f "$OPTIONAL_REQUIREMENTS" ]; then
         return
     fi
 
@@ -117,16 +128,22 @@ install_dependencies() {
     elif [ -x "$python_dir/pip3" ]; then
         pip_cmd="$python_dir/pip3"
     else
-        # Fall back to running pip as module
         pip_cmd="$PYTHON_BIN -m pip"
     fi
 
-    print_info "Installing dependencies into: $(dirname "$PYTHON_BIN")/"
-    if $pip_cmd install -r "$REQUIREMENTS" -q 2>/dev/null; then
-        print_success "Dependencies installed"
+    # Skip silently if pip isn't usable — the tools work without optional deps.
+    if ! $pip_cmd --version &>/dev/null; then
+        print_info "pip unavailable — skipping optional packages (tools work without them)"
+        print_info "For AES-GCM encryption later: install 'cryptography' into $PYTHON_BIN"
+        return
+    fi
+
+    print_info "Installing optional packages (cryptography, tqdm) — best effort ..."
+    if $pip_cmd install -r "$OPTIONAL_REQUIREMENTS" -q 2>/dev/null; then
+        print_success "Optional packages installed"
     else
-        print_warning "Some dependencies may have failed to install"
-        print_info "Try manually: $pip_cmd install -r $REQUIREMENTS"
+        print_warning "Optional packages not installed (tools still work without them)"
+        print_info "Auto-encryption uses a built-in stdlib fallback when 'cryptography' is absent"
     fi
 }
 

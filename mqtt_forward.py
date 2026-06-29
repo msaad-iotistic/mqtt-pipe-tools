@@ -21,7 +21,7 @@ import uuid
 from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mqtt_cat import MQTTNetcat, COMPRESSION_TYPES, COMPRESSION_NONE, Encryptor
+from mqtt_cat import MQTTNetcat, COMPRESSION_TYPES, COMPRESSION_NONE, Encryptor, HAVE_CRYPTOGRAPHY
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 WORDLIST_FILE = os.path.join(SCRIPT_DIR, "wordlist.txt")
@@ -217,6 +217,18 @@ def derive_time_based_key(secret: str, code: str, window_size: int = 1000, time_
 def get_encryption_config(args, env_config: dict, code: str = None) -> dict:
     enc = {}
     explicit_key = args.encryption_key or env_config.get("encryption_key")
+
+    # An explicit user-supplied key requires real AES-GCM (cryptography). Auto-encryption
+    # can fall back to the stdlib scheme, but an explicit key must not be silently downgraded.
+    if explicit_key and not HAVE_CRYPTOGRAPHY:
+        print(
+            "Error: --encryption-key requires the 'cryptography' package, which is not "
+            "installed.\nInstall it (pip install cryptography) or omit --encryption-key to "
+            "use built-in auto-encryption.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     enc["encryption_key"] = explicit_key
     enc["encryption_salt"] = args.encryption_salt or env_config.get("encryption_salt")
     iterations = args.encryption_iterations or env_config.get("encryption_iterations")
@@ -262,6 +274,9 @@ def create_client(mode: str, code: str, profile: dict, enc_config: dict,
         encryption_key=enc_config.get("encryption_key"),
         encryption_salt=enc_config.get("encryption_salt"),
         encryption_iterations=enc_config.get("encryption_iterations", 210000),
+        # Explicit keys are already gated in get_encryption_config; any key reaching
+        # here without cryptography is auto-derived and may use the stdlib fallback.
+        allow_fallback_encryption=True,
     )
 
 

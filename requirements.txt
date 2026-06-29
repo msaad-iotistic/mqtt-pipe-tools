@@ -1,3 +1,7 @@
-paho-mqtt==1.6.1
-cryptography
-tqdm
+# Runtime dependencies for mqtt-pipe-tools.
+#
+# paho-mqtt is VENDORED under _vendor/paho/ (see _vendor/README.md), so the tools
+# run with no pip-installed dependencies on minimal/embedded systems.
+#
+# The packages below are OPTIONAL enhancements — see requirements-optional.txt.
+# Nothing here is required for basic operation.

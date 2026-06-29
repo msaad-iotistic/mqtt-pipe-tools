@@ -1,5 +1,7 @@
 __pycache__
 venv/
+# Vendored deps are committed, but never their bytecode caches.
+_vendor/**/__pycache__/
 files/
 mqtt_profiles.json
 *.crt
