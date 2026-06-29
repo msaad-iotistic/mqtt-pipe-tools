@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import random
+import shlex
 import signal
 import sys
 import tarfile
@@ -328,7 +329,16 @@ def get_encryption_config(args, env_config: dict, code: str = None) -> dict:
         derived_key, derived_salt = derive_time_based_key(args.secret, code, args.key_window)
         enc["encryption_key"] = derived_key
         enc["encryption_salt"] = derived_salt
-        
+
+        # Warn when falling back to the weaker stdlib scheme (cryptography missing).
+        if not HAVE_CRYPTOGRAPHY:
+            logger.warning("cryptography library not found — using built-in stdlib "
+                           "encryption fallback (weaker than AES-GCM). The peer must "
+                           "also lack cryptography for the transfer to succeed.")
+            print("⚠️  Warning: 'cryptography' not installed — using built-in fallback "
+                  "encryption (weaker than AES-GCM). Install it with: pip install cryptography",
+                  file=sys.stderr)
+
         # Warn if using default secret
         if args.secret == "secret123":
             logger.warning("Using default secret 'secret123' for auto-encryption. "
@@ -352,6 +362,60 @@ def get_transfer_config(args, env_config: dict) -> dict:
         "chunk_size": chunk_size,
         "compression_type": compression_type,
     }
+
+
+def build_receive_command(args, code: str, enc_config: dict) -> str:
+    """Build the suggested receiver command, mirroring the sender's
+    transfer-relevant options (broker, encryption, non-default compression).
+    Reproduces only flags the user explicitly passed on the CLI; receiver-irrelevant
+    options (--chunk-size, --qos, --no-archive, --output, --force-overwrite) are omitted.
+    """
+    parts = ["mqtt-wormhole", "--code", code]
+
+    # Broker connection — explicit CLI flags only.
+    if args.broker:
+        parts += ["--broker", args.broker]
+    else:
+        if args.profiles_file:
+            parts += ["--profiles-file", args.profiles_file]
+        if args.profile:
+            parts += ["--profile", args.profile]
+        if args.host:
+            parts += ["--host", args.host]
+        if args.port:
+            parts += ["--port", str(args.port)]
+        if args.username:
+            parts += ["--username", args.username]
+        if args.password:
+            parts += ["--password", args.password]
+        if args.tls:
+            parts.append("--tls")
+        if args.insecure:
+            parts.append("--insecure")
+        if args.ca_certs:
+            parts += ["--ca-certs", args.ca_certs]
+
+    # Compression — only when explicitly non-default (mismatch breaks decompress).
+    if args.compress and args.compress != "deflate":
+        parts += ["--compress", args.compress]
+
+    # Encryption.
+    if args.no_auto_encrypt:
+        parts.append("--no-auto-encrypt")
+    if args.encryption_key:
+        # Explicit-key path (auto_encrypt is False whenever a key is supplied).
+        parts += ["--encryption-key", args.encryption_key]
+        if args.encryption_salt:
+            parts += ["--encryption-salt", args.encryption_salt]
+        if args.encryption_iterations:
+            parts += ["--encryption-iterations", str(args.encryption_iterations)]
+    elif enc_config.get("auto_encrypt"):
+        if enc_config.get("secret") and enc_config["secret"] != "secret123":
+            parts += ["--secret", enc_config["secret"]]
+        if args.key_window != 1000:
+            parts += ["--key-window", str(args.key_window)]
+
+    return " ".join(shlex.quote(p) for p in parts)
 
 
 def derive_time_based_key(secret: str, code: str, window_size: int = 1000, time_offset: int = 0) -> tuple:
@@ -781,10 +845,8 @@ def do_send(args, env_config: dict):
             print(f"🔒 Auto-encryption: enabled (custom secret)", file=sys.stderr)
     print(file=sys.stderr)
     print(f"On the receiving end, run:", file=sys.stderr)
-    if enc_config.get("auto_encrypt") and enc_config.get("secret") != "secret123":
-        print(f"  \033[1mmqtt-wormhole --code {code} --secret {enc_config['secret']}\033[0m", file=sys.stderr)
-    else:
-        print(f"  \033[1mmqtt-wormhole --code {code}\033[0m", file=sys.stderr)
+    recv_cmd = build_receive_command(args, code, enc_config)
+    print(f"  \033[1m{recv_cmd}\033[0m", file=sys.stderr)
     print(file=sys.stderr)
 
     # Sender uses "connect" mode (publishes to prefix/listen, subscribes to prefix/connect)

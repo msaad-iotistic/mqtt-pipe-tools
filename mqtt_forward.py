@@ -300,6 +300,14 @@ def get_encryption_config(args, env_config: dict, code: str = None) -> dict:
         derived_key, derived_salt = derive_time_based_key(args.secret, code, args.key_window)
         enc["encryption_key"] = derived_key
         enc["encryption_salt"] = derived_salt
+        # Warn when falling back to the weaker stdlib scheme (cryptography missing).
+        if not HAVE_CRYPTOGRAPHY:
+            logger.warning("cryptography library not found — using built-in stdlib "
+                           "encryption fallback (weaker than AES-GCM). The peer must "
+                           "also lack cryptography for the tunnel to succeed.")
+            print("⚠️  Warning: 'cryptography' not installed — using built-in fallback "
+                  "encryption (weaker than AES-GCM). Install it with: pip install cryptography",
+                  file=sys.stderr)
         if args.secret == "secret123":
             logger.warning("Using default secret 'secret123' for auto-encryption. "
                          "For better security, use --secret with a custom value.")
