@@ -119,18 +119,35 @@ def parse_env_file(filepath: str) -> dict:
     return env
 
 
-def load_profiles_config() -> dict:
-    """Load configuration from mqtt_profiles.json."""
+def load_profiles_config(profiles_file: str = DEFAULT_PROFILES_FILE,
+                         profile_name: str = DEFAULT_PROFILE_NAME,
+                         strict: bool = False) -> dict:
+    """Load one named profile from a profiles JSON file.
+
+    When strict, a missing file or missing profile is a fatal error (used when the
+    user explicitly requested a file/profile). Otherwise it silently returns {} so
+    the caller can fall back to other config sources.
+    """
     config = {}
-    if not os.path.exists(DEFAULT_PROFILES_FILE):
+    if not os.path.exists(profiles_file):
+        if strict:
+            print(f"Error: Profiles file not found: {profiles_file}", file=sys.stderr)
+            sys.exit(1)
         return config
-    
+
     try:
-        with open(DEFAULT_PROFILES_FILE, "r") as f:
+        with open(profiles_file, "r") as f:
             profiles = json.load(f)
-        
-        if DEFAULT_PROFILE_NAME in profiles:
-            profile = profiles[DEFAULT_PROFILE_NAME]
+
+        if profile_name not in profiles:
+            if strict:
+                print(f"Error: Profile '{profile_name}' not found in {profiles_file}. "
+                      f"Available: {', '.join(profiles) or '(none)'}", file=sys.stderr)
+                sys.exit(1)
+            return config
+
+        if profile_name in profiles:
+            profile = profiles[profile_name]
             # Map profile keys to our config keys
             key_mapping = {
                 "host": "host",
@@ -152,16 +169,34 @@ def load_profiles_config() -> dict:
             for profile_key, conf_key in key_mapping.items():
                 if profile_key in profile and profile[profile_key]:
                     config[conf_key] = profile[profile_key]
-    except Exception:
-        pass
-    
+    except SystemExit:
+        raise
+    except Exception as e:
+        if strict:
+            print(f"Error: Failed to read profiles file {profiles_file}: {e}", file=sys.stderr)
+            sys.exit(1)
+
     return config
 
 
-def load_env_config() -> dict:
-    """Load configuration from .env file, fallback to mqtt_profiles.json."""
+def load_env_config(args=None) -> dict:
+    """Resolve broker config. Precedence: explicit --profiles-file/--profile >
+    .env file > default profiles file.
+    """
+    profiles_file = getattr(args, "profiles_file", None)
+    profile_name = getattr(args, "profile", None)
+
+    # Explicitly requested a profiles file and/or a named profile → use it directly,
+    # bypassing the ambient .env. Errors here are fatal (strict).
+    if profiles_file or profile_name:
+        return load_profiles_config(
+            profiles_file or DEFAULT_PROFILES_FILE,
+            profile_name or DEFAULT_PROFILE_NAME,
+            strict=True,
+        )
+
     config = {}
-    
+
     # Priority 1: .env file
     if os.path.exists(ENV_FILE):
         env = parse_env_file(ENV_FILE)
@@ -212,7 +247,9 @@ def build_profile(args, env_config: dict) -> dict:
 
         for key in ["tls", "insecure", "force_overwrite"]:
             if key in env_config:
-                profile[key] = env_config[key].lower() in ("true", "1", "yes")
+                val = env_config[key]
+                # .env values are strings; profiles-file values are native JSON bools.
+                profile[key] = val if isinstance(val, bool) else str(val).lower() in ("true", "1", "yes")
 
     if args.host:
         profile["host"] = args.host
@@ -234,7 +271,21 @@ def build_profile(args, env_config: dict) -> dict:
         profile["force_overwrite"] = True
 
     if "host" not in profile:
-        print("Error: No MQTT host specified. Use --host or set MQTT_HOST in .env", file=sys.stderr)
+        broker_list = ", ".join("{}={}".format(n, p["host"]) for n, p in BUILTIN_PROFILES.items())
+        print(
+            "Error: No MQTT broker specified. Provide one of the following "
+            "(highest priority first):\n"
+            "\n"
+            "  1. CLI flags         --host HOST [--port PORT] [--username U] [--password P] [--tls]\n"
+            "  2. Built-in preset   --broker NAME   (public, no-auth brokers)\n"
+            "                       " + broker_list + "\n"
+            "  3. .env file         set MQTT_HOST (and MQTT_PORT, etc.) in " + ENV_FILE + "\n"
+            "  4. Profiles file     '" + DEFAULT_PROFILE_NAME + "' profile in " + DEFAULT_PROFILES_FILE + "\n"
+            "\n"
+            "Note: --broker bypasses .env/profiles config; individual CLI flags override --broker.\n"
+            "Example:  mqtt-wormhole --broker emqx myfile.pdf",
+            file=sys.stderr,
+        )
         sys.exit(1)
     if "port" not in profile:
         profile["port"] = 8883 if profile.get("tls") else 1883
@@ -1325,6 +1376,10 @@ def build_parser() -> argparse.ArgumentParser:
     broker_group = parser.add_argument_group("Broker")
     broker_group.add_argument("--broker", "-b", type=str, metavar="NAME",
                               help=f"Use a built-in public broker preset: {', '.join(BUILTIN_PROFILES)}")
+    broker_group.add_argument("--profiles-file", type=str, metavar="PATH",
+                              help=f"Path to a profiles JSON file (default: {DEFAULT_PROFILES_FILE})")
+    broker_group.add_argument("--profile", type=str, metavar="NAME",
+                              help=f"Named profile to load from the profiles file (default: {DEFAULT_PROFILE_NAME})")
     broker_group.add_argument("--host", "-H", type=str, help="MQTT broker host")
     broker_group.add_argument("--port", "-P", type=str, help="MQTT broker port")
     broker_group.add_argument("--username", "-u", type=str, help="MQTT username")
@@ -1394,7 +1449,7 @@ def main():
     logger.info("="*60)
     logger.info(f"mqtt-wormhole started (version {PROTOCOL_VERSION})")
 
-    env_config = load_env_config()
+    env_config = load_env_config(args)
 
     is_receive = args.receive or (len(args.files) == 0)
 

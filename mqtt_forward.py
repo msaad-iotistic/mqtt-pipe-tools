@@ -123,32 +123,64 @@ def parse_env_file(filepath: str) -> dict:
     return env
 
 
-def load_profiles_config() -> dict:
+def load_profiles_config(profiles_file: str = DEFAULT_PROFILES_FILE,
+                         profile_name: str = DEFAULT_PROFILE_NAME,
+                         strict: bool = False) -> dict:
+    """Load one named profile from a profiles JSON file.
+
+    When strict, a missing file or missing profile is a fatal error (used when the
+    user explicitly requested a file/profile). Otherwise returns {} so the caller
+    can fall back to other config sources.
+    """
     config = {}
-    if not os.path.exists(DEFAULT_PROFILES_FILE):
+    if not os.path.exists(profiles_file):
+        if strict:
+            print(f"Error: Profiles file not found: {profiles_file}", file=sys.stderr)
+            sys.exit(1)
         return config
     try:
-        with open(DEFAULT_PROFILES_FILE, "r") as f:
+        with open(profiles_file, "r") as f:
             profiles = json.load(f)
-        if DEFAULT_PROFILE_NAME in profiles:
-            profile = profiles[DEFAULT_PROFILE_NAME]
-            key_mapping = {
-                "host": "host", "port": "port", "username": "username",
-                "password": "password", "tls": "tls", "insecure": "insecure",
-                "ca_certs": "ca_certs", "certfile": "certfile", "keyfile": "keyfile",
-                "encryption_key": "encryption_key", "encryption_salt": "encryption_salt",
-                "encryption_iterations": "encryption_iterations",
-                "qos": "qos", "chunk_size": "chunk_size", "compression": "compression",
-            }
-            for profile_key, conf_key in key_mapping.items():
-                if profile_key in profile and profile[profile_key]:
-                    config[conf_key] = profile[profile_key]
-    except Exception:
-        pass
+        if profile_name not in profiles:
+            if strict:
+                print(f"Error: Profile '{profile_name}' not found in {profiles_file}. "
+                      f"Available: {', '.join(profiles) or '(none)'}", file=sys.stderr)
+                sys.exit(1)
+            return config
+        profile = profiles[profile_name]
+        key_mapping = {
+            "host": "host", "port": "port", "username": "username",
+            "password": "password", "tls": "tls", "insecure": "insecure",
+            "ca_certs": "ca_certs", "certfile": "certfile", "keyfile": "keyfile",
+            "encryption_key": "encryption_key", "encryption_salt": "encryption_salt",
+            "encryption_iterations": "encryption_iterations",
+            "qos": "qos", "chunk_size": "chunk_size", "compression": "compression",
+        }
+        for profile_key, conf_key in key_mapping.items():
+            if profile_key in profile and profile[profile_key]:
+                config[conf_key] = profile[profile_key]
+    except SystemExit:
+        raise
+    except Exception as e:
+        if strict:
+            print(f"Error: Failed to read profiles file {profiles_file}: {e}", file=sys.stderr)
+            sys.exit(1)
     return config
 
 
-def load_env_config() -> dict:
+def load_env_config(args=None) -> dict:
+    """Resolve broker config. Precedence: explicit --profiles-file/--profile >
+    .env file > default profiles file.
+    """
+    profiles_file = getattr(args, "profiles_file", None)
+    profile_name = getattr(args, "profile", None)
+    if profiles_file or profile_name:
+        return load_profiles_config(
+            profiles_file or DEFAULT_PROFILES_FILE,
+            profile_name or DEFAULT_PROFILE_NAME,
+            strict=True,
+        )
+
     config = {}
     if os.path.exists(ENV_FILE):
         env = parse_env_file(ENV_FILE)
@@ -185,7 +217,9 @@ def build_profile(args, env_config: dict) -> dict:
                 profile[key] = env_config[key]
         for key in ["tls", "insecure"]:
             if key in env_config:
-                profile[key] = env_config[key].lower() in ("true", "1", "yes")
+                val = env_config[key]
+                # .env values are strings; profiles-file values are native JSON bools.
+                profile[key] = val if isinstance(val, bool) else str(val).lower() in ("true", "1", "yes")
     if args.host:
         profile["host"] = args.host
     if args.port:
@@ -203,7 +237,21 @@ def build_profile(args, env_config: dict) -> dict:
     if args.ca_certs:
         profile["ca_certs"] = args.ca_certs
     if "host" not in profile:
-        print("Error: No MQTT host specified. Use --host or set MQTT_HOST in .env", file=sys.stderr)
+        broker_list = ", ".join("{}={}".format(n, p["host"]) for n, p in BUILTIN_PROFILES.items())
+        print(
+            "Error: No MQTT broker specified. Provide one of the following "
+            "(highest priority first):\n"
+            "\n"
+            "  1. CLI flags         --host HOST [--port PORT] [--username U] [--password P] [--tls]\n"
+            "  2. Built-in preset   --broker NAME   (public, no-auth brokers)\n"
+            "                       " + broker_list + "\n"
+            "  3. .env file         set MQTT_HOST (and MQTT_PORT, etc.) in " + ENV_FILE + "\n"
+            "  4. Profiles file     '" + DEFAULT_PROFILE_NAME + "' profile in " + DEFAULT_PROFILES_FILE + "\n"
+            "\n"
+            "Note: --broker bypasses .env/profiles config; individual CLI flags override --broker.\n"
+            "Example:  mqtt-forward --broker emqx --listen :8080",
+            file=sys.stderr,
+        )
         sys.exit(1)
     if "port" not in profile:
         profile["port"] = 8883 if profile.get("tls") else 1883
@@ -1083,6 +1131,10 @@ def build_parser() -> argparse.ArgumentParser:
     broker_group = parser.add_argument_group("Broker")
     broker_group.add_argument("--broker", "-b", type=str, metavar="NAME",
                               help=f"Use a built-in public broker preset: {', '.join(BUILTIN_PROFILES)}")
+    broker_group.add_argument("--profiles-file", type=str, metavar="PATH",
+                              help=f"Path to a profiles JSON file (default: {DEFAULT_PROFILES_FILE})")
+    broker_group.add_argument("--profile", type=str, metavar="NAME",
+                              help=f"Named profile to load from the profiles file (default: {DEFAULT_PROFILE_NAME})")
     broker_group.add_argument("--host", "-H", type=str, help="MQTT broker host")
     broker_group.add_argument("--port", "-P", type=str, help="MQTT broker port")
     broker_group.add_argument("--username", "-u", type=str, help="MQTT username")
@@ -1146,7 +1198,7 @@ def main():
     logger.info("=" * 60)
     logger.info(f"mqtt-forward started (version {PROTOCOL_VERSION})")
 
-    env_config = load_env_config()
+    env_config = load_env_config(args)
 
     if args.listen:
         do_client(args, env_config)
