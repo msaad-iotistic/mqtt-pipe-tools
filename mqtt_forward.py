@@ -246,7 +246,8 @@ def build_profile(args, env_config: dict) -> dict:
             "  2. Built-in preset   --broker NAME   (public, no-auth brokers)\n"
             "                       " + broker_list + "\n"
             "  3. .env file         set MQTT_HOST (and MQTT_PORT, etc.) in " + ENV_FILE + "\n"
-            "  4. Profiles file     '" + DEFAULT_PROFILE_NAME + "' profile in " + DEFAULT_PROFILES_FILE + "\n"
+            "  4. Profiles file     --profiles-file PATH   (default: " + DEFAULT_PROFILES_FILE + ")\n"
+            "                       --profile NAME         (default: " + DEFAULT_PROFILE_NAME + ")\n"
             "\n"
             "Note: --broker bypasses .env/profiles config; individual CLI flags override --broker.\n"
             "Example:  mqtt-forward --broker emqx --listen :8080",
