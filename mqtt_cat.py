@@ -38,6 +38,17 @@ try:
 except ImportError:
     HAVE_CRYPTOGRAPHY = False
 
+# When True, every Encryptor uses the stdlib fallback scheme even if cryptography is
+# installed — e.g. to interoperate with a peer that lacks cryptography. Toggle via
+# set_force_fallback(); Encryptor instances read it at construction time.
+_FORCE_FALLBACK = False
+
+
+def set_force_fallback(value: bool = True):
+    """Force (or unforce) the stdlib fallback encryption scheme for new Encryptors."""
+    global _FORCE_FALLBACK
+    _FORCE_FALLBACK = bool(value)
+
 # Built-in public broker profiles, selectable by name (e.g. --broker emqx) so the
 # tools work out of the box with no config file. All are anonymous/no-credential.
 BUILTIN_PROFILES = {
@@ -166,10 +177,16 @@ class Encryptor:
     _FB_NONCE = 16
     _FB_TAG = 32
 
-    def __init__(self, password: Optional[str] = None, salt: bytes = b"", iterations: int = 210000):
+    def __init__(self, password: Optional[str] = None, salt: bytes = b"", iterations: int = 210000,
+                 force_fallback: Optional[bool] = None):
         self.key = None
         self.enc_key = None
         self.mac_key = None
+        # Use the stdlib fallback when cryptography is unavailable, or when explicitly
+        # forced (per-instance arg, else the module-level _FORCE_FALLBACK switch) — e.g.
+        # to interoperate with a peer that lacks cryptography.
+        force = _FORCE_FALLBACK if force_fallback is None else force_fallback
+        self.use_fallback = force or not HAVE_CRYPTOGRAPHY
         if password:
             if len(password) < 32:
                 raise ValueError("Encryption key must be at least 32 characters")
@@ -191,7 +208,7 @@ class Encryptor:
 
     def derive_key(self, password: bytes, salt: bytes, iterations: int):
         """Derive a 32-byte key from the password using PBKDF2-HMAC-SHA256."""
-        if HAVE_CRYPTOGRAPHY:
+        if not self.use_fallback:
             kdf = PBKDF2HMAC(
                 algorithm=hashes.SHA256(),
                 length=32,
@@ -222,7 +239,7 @@ class Encryptor:
         if not self.key:
             return plaintext
 
-        if HAVE_CRYPTOGRAPHY:
+        if not self.use_fallback:
             nonce = os.urandom(12)
             aesgcm = AESGCM(self.key)
             ciphertext = aesgcm.encrypt(nonce, plaintext, aad)
@@ -237,7 +254,7 @@ class Encryptor:
 
     def decrypt(self, ciphertext: bytes, aad: bytes) -> bytes:
         """Decrypt data, verifying the AAD. Raises ValueError on auth failure."""
-        if HAVE_CRYPTOGRAPHY:
+        if not self.use_fallback:
             if not self.key or len(ciphertext) < 12:
                 return ciphertext
             nonce = ciphertext[:12]
@@ -523,10 +540,11 @@ class MQTTNetcat:
                 raise RuntimeError(msg)
             try:
                 salt = base64.b64decode(encryption_salt) if encryption_salt else b""
-                self.userdata["encryptor"] = Encryptor(
+                encryptor = Encryptor(
                     password=encryption_key, salt=salt, iterations=encryption_iterations
                 )
-                backend = "AES-GCM" if HAVE_CRYPTOGRAPHY else "stdlib-fallback"
+                self.userdata["encryptor"] = encryptor
+                backend = "stdlib-fallback" if encryptor.use_fallback else "AES-GCM"
                 self.logger.info(f"Encryption enabled (backend: {backend})")
                 self.logger.debug(f"Using salt: {base64.b64encode(salt).decode()}")
                 self.logger.debug(f"PBKDF2 iterations: {encryption_iterations}")

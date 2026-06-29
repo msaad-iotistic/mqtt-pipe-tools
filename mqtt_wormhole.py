@@ -31,7 +31,8 @@ except ImportError:
 
 # Add parent directory to path so we can import mqtt_cat
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mqtt_cat import MQTTNetcat, COMPRESSION_TYPES, COMPRESSION_NONE, HAVE_CRYPTOGRAPHY, BUILTIN_PROFILES
+from mqtt_cat import (MQTTNetcat, COMPRESSION_TYPES, COMPRESSION_NONE, HAVE_CRYPTOGRAPHY,
+                      BUILTIN_PROFILES, set_force_fallback)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 WORDLIST_FILE = os.path.join(SCRIPT_DIR, "wordlist.txt")
@@ -303,15 +304,23 @@ def get_encryption_config(args, env_config: dict, code: str = None) -> dict:
     explicit_key = args.encryption_key or env_config.get("encryption_key")
 
     # An explicit user-supplied key requires real AES-GCM (cryptography). Auto-encryption
-    # can fall back to the stdlib scheme, but an explicit key must not be silently downgraded.
+    # can fall back to the stdlib scheme, but an explicit key must not be silently downgraded
+    # unless the user explicitly opts in (--allow-insecure-encryption / --force-fallback-encryption).
+    allow_insecure = getattr(args, "allow_insecure_encryption", False) or getattr(args, "force_fallback_encryption", False)
     if explicit_key and not HAVE_CRYPTOGRAPHY:
-        print(
-            "Error: --encryption-key requires the 'cryptography' package, which is not "
-            "installed.\nInstall it (pip install cryptography) or omit --encryption-key to "
-            "use built-in auto-encryption.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        if not allow_insecure:
+            print(
+                "Error: --encryption-key requires the 'cryptography' package, which is not "
+                "installed.\nInstall it (pip install cryptography), or pass --allow-insecure-encryption "
+                "to use the weaker built-in fallback scheme, or omit --encryption-key to use "
+                "auto-encryption.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        logger.warning("Using explicit --encryption-key with the weaker stdlib fallback "
+                       "(cryptography not installed; --allow-insecure-encryption set).")
+        print("⚠️  Warning: using --encryption-key with the built-in fallback scheme "
+              "(weaker than AES-GCM). The peer must use the same.", file=sys.stderr)
 
     enc["encryption_key"] = explicit_key
     enc["encryption_salt"] = args.encryption_salt or env_config.get("encryption_salt")
@@ -414,6 +423,17 @@ def build_receive_command(args, code: str, enc_config: dict) -> str:
             parts += ["--secret", enc_config["secret"]]
         if args.key_window != 1000:
             parts += ["--key-window", str(args.key_window)]
+
+    # Encryption-scheme flags must match on both ends, so surface them to the receiver.
+    # The sender uses the stdlib fallback whenever cryptography is missing OR it was
+    # forced — in either case the receiver must use the same scheme, so emit
+    # --force-fallback-encryption (which also lets a crypto-less receiver accept an
+    # explicit key). This covers the case where the sender simply lacks cryptography
+    # and never passed a flag.
+    encryption_active = bool(args.encryption_key) or enc_config.get("auto_encrypt")
+    using_fallback = not HAVE_CRYPTOGRAPHY or getattr(args, "force_fallback_encryption", False)
+    if encryption_active and using_fallback:
+        parts.append("--force-fallback-encryption")
 
     return " ".join(shlex.quote(p) for p in parts)
 
@@ -1461,6 +1481,12 @@ def build_parser() -> argparse.ArgumentParser:
                           help="Time window in seconds for auto-encryption key validity (default: 1000)")
     enc_group.add_argument("--no-auto-encrypt", action="store_true",
                           help="Disable automatic encryption (when no explicit key is configured)")
+    enc_group.add_argument("--force-fallback-encryption", action="store_true",
+                          help="Use the built-in stdlib encryption scheme even if 'cryptography' "
+                               "is installed (for interop with a peer that lacks it)")
+    enc_group.add_argument("--allow-insecure-encryption", action="store_true",
+                          help="Allow --encryption-key with the weaker fallback scheme when "
+                               "'cryptography' is not installed (instead of erroring)")
 
     xfer_group = parser.add_argument_group("Transfer")
     xfer_group.add_argument("--qos", type=int, choices=[0, 1, 2], default=None, help="QoS level (default: 1)")
@@ -1511,6 +1537,14 @@ def main():
     setup_logging(log_file, args.verbose)
     logger.info("="*60)
     logger.info(f"mqtt-wormhole started (version {PROTOCOL_VERSION})")
+
+    # Force the stdlib fallback scheme for all Encryptors when requested.
+    if getattr(args, "force_fallback_encryption", False):
+        set_force_fallback(True)
+        logger.info("Forcing built-in stdlib encryption scheme (--force-fallback-encryption)")
+        if HAVE_CRYPTOGRAPHY:
+            print("ℹ️  Using built-in fallback encryption (forced); peer must do the same.",
+                  file=sys.stderr)
 
     env_config = load_env_config(args)
 
