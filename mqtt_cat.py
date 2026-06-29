@@ -38,6 +38,14 @@ try:
 except ImportError:
     HAVE_CRYPTOGRAPHY = False
 
+# Built-in public broker profiles, selectable by name (e.g. --broker emqx) so the
+# tools work out of the box with no config file. All are anonymous/no-credential.
+BUILTIN_PROFILES = {
+    "emqx": {"host": "broker.emqx.io", "port": 1883},
+    "mosquitto": {"host": "test.mosquitto.org", "port": 1883},
+    "eclipse": {"host": "mqtt.eclipseprojects.io", "port": 1883},
+}
+
 # Default configuration
 DEFAULTS = {
     "CHUNK_SIZE": 1024 * 64,

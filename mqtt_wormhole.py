@@ -30,7 +30,7 @@ except ImportError:
 
 # Add parent directory to path so we can import mqtt_cat
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mqtt_cat import MQTTNetcat, COMPRESSION_TYPES, COMPRESSION_NONE, HAVE_CRYPTOGRAPHY
+from mqtt_cat import MQTTNetcat, COMPRESSION_TYPES, COMPRESSION_NONE, HAVE_CRYPTOGRAPHY, BUILTIN_PROFILES
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 WORDLIST_FILE = os.path.join(SCRIPT_DIR, "wordlist.txt")
@@ -194,16 +194,25 @@ def load_env_config() -> dict:
 
 
 def build_profile(args, env_config: dict) -> dict:
-    """Build MQTT profile from args and env config. Args override env."""
+    """Build MQTT profile. Precedence: CLI flags > --broker preset > env config."""
     profile = {}
 
-    for key in ["host", "port", "username", "password", "ca_certs", "certfile", "keyfile"]:
-        if key in env_config:
-            profile[key] = env_config[key]
+    # An explicit --broker preset bypasses ambient env config entirely (only CLI
+    # flags below override it); otherwise fall back to .env / profiles config.
+    if getattr(args, "broker", None):
+        if args.broker not in BUILTIN_PROFILES:
+            print(f"Error: Unknown broker '{args.broker}'. Available: "
+                  f"{', '.join(BUILTIN_PROFILES)}", file=sys.stderr)
+            sys.exit(1)
+        profile.update(BUILTIN_PROFILES[args.broker])
+    else:
+        for key in ["host", "port", "username", "password", "ca_certs", "certfile", "keyfile"]:
+            if key in env_config:
+                profile[key] = env_config[key]
 
-    for key in ["tls", "insecure", "force_overwrite"]:
-        if key in env_config:
-            profile[key] = env_config[key].lower() in ("true", "1", "yes")
+        for key in ["tls", "insecure", "force_overwrite"]:
+            if key in env_config:
+                profile[key] = env_config[key].lower() in ("true", "1", "yes")
 
     if args.host:
         profile["host"] = args.host
@@ -1314,6 +1323,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     broker_group = parser.add_argument_group("Broker")
+    broker_group.add_argument("--broker", "-b", type=str, metavar="NAME",
+                              help=f"Use a built-in public broker preset: {', '.join(BUILTIN_PROFILES)}")
     broker_group.add_argument("--host", "-H", type=str, help="MQTT broker host")
     broker_group.add_argument("--port", "-P", type=str, help="MQTT broker port")
     broker_group.add_argument("--username", "-u", type=str, help="MQTT username")
