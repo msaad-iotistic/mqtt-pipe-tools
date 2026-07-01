@@ -13,6 +13,7 @@ import logging
 import os
 import random
 import select
+import shlex
 import signal
 import socket
 import sys
@@ -336,6 +337,71 @@ def get_transfer_config(args, env_config: dict) -> dict:
     compress = args.compress or "none"
     compression_type = COMPRESSION_TYPES.get(compress, COMPRESSION_NONE)
     return {"qos": qos, "chunk_size": chunk_size, "compression_type": compression_type}
+
+
+def build_client_command(args, code: str, enc_config: dict) -> str:
+    """Build the suggested client command, mirroring the server's interop-relevant
+    options (broker, encryption, non-default compression). Reproduces only flags the
+    user explicitly passed on the CLI; server-only / operational options (--connect,
+    --rate-limit, --qos, --chunk-size, etc.) are omitted. The listen port is the
+    client's own choice, so it stays a :PORT placeholder.
+    """
+    parts = ["mqtt-forward", "--listen", ":PORT", "--code", code]
+
+    # Broker connection — explicit CLI flags only.
+    if args.broker:
+        parts += ["--broker", args.broker]
+    else:
+        if args.profiles_file:
+            parts += ["--profiles-file", args.profiles_file]
+        if args.profile:
+            parts += ["--profile", args.profile]
+        if args.host:
+            parts += ["--host", args.host]
+        if args.port:
+            parts += ["--port", str(args.port)]
+        if args.username:
+            parts += ["--username", args.username]
+        if args.password:
+            parts += ["--password", args.password]
+        if args.tls:
+            parts.append("--tls")
+        if args.insecure:
+            parts.append("--insecure")
+        if args.ca_certs:
+            parts += ["--ca-certs", args.ca_certs]
+
+    # Compression — only when explicitly non-default (default is "none"; mismatch breaks decompress).
+    if args.compress and args.compress != "none":
+        parts += ["--compress", args.compress]
+
+    # Encryption.
+    if args.no_auto_encrypt:
+        parts.append("--no-auto-encrypt")
+    if args.encryption_key:
+        # Explicit-key path (auto_encrypt is False whenever a key is supplied).
+        parts += ["--encryption-key", args.encryption_key]
+        if args.encryption_salt:
+            parts += ["--encryption-salt", args.encryption_salt]
+        if args.encryption_iterations:
+            parts += ["--encryption-iterations", str(args.encryption_iterations)]
+    elif enc_config.get("auto_encrypt"):
+        if enc_config.get("secret") and enc_config["secret"] != "secret123":
+            parts += ["--secret", enc_config["secret"]]
+        if args.key_window != 1000:
+            parts += ["--key-window", str(args.key_window)]
+
+    # Encryption-scheme flags must match on both ends. The sender uses the stdlib
+    # fallback whenever cryptography is missing OR it was forced — in either case the
+    # client must use the same scheme, so emit --force-fallback-encryption (which also
+    # lets a crypto-less client accept an explicit key, covering the case where the
+    # sender simply lacks cryptography and never passed a flag).
+    encryption_active = bool(args.encryption_key) or enc_config.get("auto_encrypt")
+    using_fallback = not HAVE_CRYPTOGRAPHY or getattr(args, "force_fallback_encryption", False)
+    if encryption_active and using_fallback:
+        parts.append("--force-fallback-encryption")
+
+    return " ".join(shlex.quote(p) for p in parts)
 
 
 def create_client(mode: str, code: str, profile: dict, enc_config: dict,
@@ -811,10 +877,7 @@ def do_server(args, env_config: dict):
         else:
             print("🔒 Auto-encryption: enabled (custom secret)", file=sys.stderr)
     print(f"On the client side, run:", file=sys.stderr)
-    if enc_config.get("auto_encrypt") and enc_config.get("secret") != "secret123":
-        print(f"  mqtt-forward --listen :PORT --code {code} --secret {enc_config['secret']}", file=sys.stderr)
-    else:
-        print(f"  mqtt-forward --listen :PORT --code {code}", file=sys.stderr)
+    print(f"  {build_client_command(args, code, enc_config)}", file=sys.stderr)
     print(file=sys.stderr)
 
     client = create_client("connect", code, profile, enc_config, transfer_config, verbose=args.verbose)
