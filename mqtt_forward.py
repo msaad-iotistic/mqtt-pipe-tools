@@ -753,6 +753,8 @@ def do_challenge_response_auth(client: MQTTNetcat, enc_config: dict, code: str,
                                 is_server: bool, challenge_msg: dict = None) -> bool:
     """Perform challenge-response authentication. Returns True on success."""
     if not enc_config.get("auto_encrypt"):
+        if is_server:
+            send_control(client, MSG_ACCEPTED, {"window_offset": 0})
         return True
 
     if is_server:
@@ -1127,7 +1129,13 @@ def do_client(args, env_config: dict):
                 cleanup()
                 sys.exit(1)
 
-            if msg_type == MSG_CHALLENGE and not authenticated:
+            if msg_type == MSG_ACCEPTED and not authenticated:
+                # No-auth path: server skipped challenge-response (--no-auto-encrypt)
+                print("✓ Authentication successful!", file=sys.stderr)
+                authenticated = True
+                monitor.reset()
+
+            elif msg_type == MSG_CHALLENGE and not authenticated:
                 print("Authenticating with server...", file=sys.stderr)
                 if not do_challenge_response_auth(client, enc_config, code, is_server=False, challenge_msg=msg):
                     print("✗ Authentication failed!", file=sys.stderr)
@@ -1137,7 +1145,8 @@ def do_client(args, env_config: dict):
                 authenticated = True
                 monitor.reset()
 
-                # Auth succeeded. Set up local TCP listener immediately.
+            if authenticated and not connected:
+                # Auth succeeded (either path). Set up local TCP listener.
                 logger.info("Setting up local TCP listener")
                 tcp_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 tcp_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
