@@ -177,14 +177,14 @@ def load_env_config(args=None) -> dict:
     profiles_file = getattr(args, "profiles_file", None)
     profile_name = getattr(args, "profile", None)
     if profiles_file or profile_name:
-        return load_profiles_config(
-            profiles_file or DEFAULT_PROFILES_FILE,
-            profile_name or DEFAULT_PROFILE_NAME,
-            strict=True,
-        )
+        pf = profiles_file or DEFAULT_PROFILES_FILE
+        pn = profile_name or DEFAULT_PROFILE_NAME
+        logger.info(f"Config source: profiles file {pf} (profile '{pn}')")
+        return load_profiles_config(pf, pn, strict=True)
 
     config = {}
     if os.path.exists(ENV_FILE):
+        logger.info(f"Config source: .env file {ENV_FILE}")
         env = parse_env_file(ENV_FILE)
         mapping = {
             "MQTT_HOST": "host", "MQTT_PORT": "port", "MQTT_USERNAME": "username",
@@ -199,6 +199,8 @@ def load_env_config(args=None) -> dict:
             if val is not None and val != "":
                 config[conf_key] = val
         return config
+    logger.info(f"Config source: default profiles file {DEFAULT_PROFILES_FILE} "
+                f"(profile '{DEFAULT_PROFILE_NAME}')")
     return load_profiles_config()
 
 
@@ -212,6 +214,7 @@ def build_profile(args, env_config: dict) -> dict:
             print(f"Error: Unknown broker '{args.broker}'. Available: "
                   f"{', '.join(BUILTIN_PROFILES)}", file=sys.stderr)
             sys.exit(1)
+        logger.info(f"Config source: built-in broker preset '{args.broker}' (overrides env/profiles)")
         profile.update(BUILTIN_PROFILES[args.broker])
     else:
         for key in ["host", "port", "username", "password", "ca_certs", "certfile", "keyfile"]:
