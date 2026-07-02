@@ -1216,10 +1216,10 @@ def build_parser() -> argparse.ArgumentParser:
                             help="Pairing code (auto-generated for server, required for client)")
 
     tunnel_group = parser.add_argument_group("Tunnel")
-    tunnel_group.add_argument("--rate-limit", type=str, default="1m",
-                              help="Max bytes/sec over MQTT (e.g. 500k, 2m). Applies backpressure to TCP senders. (default: 1m)")
-    tunnel_group.add_argument("--max-pub-rate", type=int, default=20,
-                              help="Max MQTT publishes/sec (default: 20)")
+    tunnel_group.add_argument("--rate-limit", type=str, default="500k",
+                              help="Max bytes/sec over MQTT (e.g. 500k, 2m). Applies backpressure to TCP senders. (default: 500k)")
+    tunnel_group.add_argument("--max-pub-rate", type=int, default=10,
+                              help="Max MQTT publishes/sec (default: 10)")
     tunnel_group.add_argument("--max-connections", type=int, default=10,
                               help="Max concurrent TCP connections (new connections are silently dropped above limit) (default: 10)")
 
