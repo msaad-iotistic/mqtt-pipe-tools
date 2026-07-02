@@ -85,17 +85,20 @@ def load_wordlist() -> list:
         ]
 
 
-def generate_code(num_words: int = 2) -> str:
-    """Generate a memorable pairing code like '7-guitar-nebula'."""
+def generate_code(num_words: int = 3) -> str:
+    """Generate a memorable pairing code like '4271-guitar-nebula-torch'."""
     words = load_wordlist()
-    number = random.randint(1, 99)
+    number = random.randint(0, 9999)
     chosen = random.sample(words, num_words)
-    return f"{number}-{'-'.join(chosen)}"
+    return f"{number:04d}-{'-'.join(chosen)}"
 
 
 def hash_code(code: str) -> str:
     """Hash a pairing code for use in MQTT topics."""
-    return hashlib.sha256(code.encode('utf-8')).hexdigest()[:16]
+    # 4 hex chars (65536 buckets): ~53M codes share each topic, preventing
+    # rainbow-table recovery of the code from the topic. Both peers must use
+    # the same prefix length or they subscribe to different topics and never meet.
+    return hashlib.sha256(code.encode('utf-8')).hexdigest()[:4]
 
 
 def parse_env_file(filepath: str) -> dict:

@@ -3,7 +3,7 @@
 mqtt-forward: TCP tunnel over MQTT with buffer-and-burst
 
 Server: mqtt-forward --listen :8080
-Client: mqtt-forward --connect host:22 --code 42-cosmic-dolphin
+Client: mqtt-forward --connect host:22 --code 4271-cosmic-dolphin-torch
 """
 import argparse
 import base64
@@ -81,15 +81,17 @@ def load_wordlist() -> list:
         ]
 
 
-def generate_code(num_words: int = 2) -> str:
+def generate_code(num_words: int = 3) -> str:
     words = load_wordlist()
-    number = random.randint(1, 99)
+    number = random.randint(0, 9999)
     chosen = random.sample(words, num_words)
-    return f"{number}-{'-'.join(chosen)}"
+    return f"{number:04d}-{'-'.join(chosen)}"
 
 
 def hash_code(code: str) -> str:
-    return hashlib.sha256(code.encode('utf-8')).hexdigest()[:16]
+    # 4 hex chars = 65536 buckets; ~53M codes per bucket prevents rainbow-table
+    # recovery. Both peers must match or they subscribe to different topics.
+    return hashlib.sha256(code.encode('utf-8')).hexdigest()[:4]
 
 
 def parse_rate(s: str) -> float:
