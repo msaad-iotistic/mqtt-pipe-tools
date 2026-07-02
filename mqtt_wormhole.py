@@ -390,7 +390,7 @@ def build_receive_command(args, code: str, enc_config: dict) -> str:
     """Build the suggested receiver command, mirroring the sender's
     transfer-relevant options (broker, encryption, non-default compression).
     Reproduces only flags the user explicitly passed on the CLI; receiver-irrelevant
-    options (--chunk-size, --qos, --no-archive, --output, --force-overwrite) are omitted.
+    options (--chunk-size, --qos, --output, --force-overwrite) are omitted.
     """
     parts = ["mqtt-wormhole", "--code", code]
 
@@ -739,8 +739,13 @@ def recv_control(client: MQTTNetcat, timeout: float = 60, drain_data=None) -> Op
 
 # ─── FILE METADATA ──────────────────────────────────────────────────────────
 
-def collect_file_metadata(paths: list, no_archive: bool = False):
-    """Collect metadata for files/directories to transfer. Returns (metadata_dict, tar_path_or_None)."""
+def collect_file_metadata(paths: list):
+    """Collect metadata for files/directories to transfer. Returns (metadata_dict, tar_path_or_None).
+
+    Directories/multiple files are bundled into a plain (uncompressed) tar — the
+    transport compresses each chunk on the wire, so gzipping the tar first would be
+    redundant double-compression (and wasted CPU on already-compressed data).
+    """
     files_meta = []
     tar_path = None
 
@@ -757,23 +762,18 @@ def collect_file_metadata(paths: list, no_archive: bool = False):
         dir_path = resolved[0]
         file_count = sum(1 for _ in dir_path.rglob("*") if _.is_file())
         dir_size = sum(f.stat().st_size for f in dir_path.rglob("*") if f.is_file())
-        if no_archive:
-            print(f"Archiving directory (no compression): {dir_path.name}/ ({file_count} files, {human_size(dir_size)})",
-                  file=sys.stderr)
-        else:
-            print(f"Compressing directory: {dir_path.name}/ ({file_count} files, {human_size(dir_size)})",
-                  file=sys.stderr)
+        print(f"Archiving directory: {dir_path.name}/ ({file_count} files, {human_size(dir_size)})",
+              file=sys.stderr)
 
         # Check if files are still being written to
         if not wait_for_stable_path(dir_path):
             print("Aborted.", file=sys.stderr)
             sys.exit(1)
 
-        tar_suffix = ".tar" if no_archive else ".tar.gz"
-        tar_mode = "w:" if no_archive else "w:gz"
+        tar_suffix = ".tar"
         tar_fd, tar_path = tempfile.mkstemp(suffix=tar_suffix)
         os.close(tar_fd)
-        with tarfile.open(tar_path, tar_mode) as tar:
+        with tarfile.open(tar_path, "w:") as tar:
             # Add entries individually (non-recursively) so we can handle per-file
             # errors and avoid duplicating subtrees — rglob already enumerates every
             # descendant, so recursive adds would write nested files multiple times.
@@ -807,11 +807,10 @@ def collect_file_metadata(paths: list, no_archive: bool = False):
                 print("Aborted.", file=sys.stderr)
                 sys.exit(1)
 
-        tar_suffix = ".tar" if no_archive else ".tar.gz"
-        tar_mode = "w:" if no_archive else "w:gz"
+        tar_suffix = ".tar"
         tar_fd, tar_path = tempfile.mkstemp(suffix=tar_suffix)
         os.close(tar_fd)
-        with tarfile.open(tar_path, tar_mode) as tar:
+        with tarfile.open(tar_path, "w:") as tar:
             for rp in resolved:
                 safe_tar_add(tar, str(rp), rp.name)
 
@@ -897,7 +896,7 @@ def do_send(args, env_config: dict):
         logger.info(f"Auto-encryption enabled (window: {enc_config['key_window']}s)")
 
     # Collect file metadata and prepare tarball if needed
-    metadata, tar_path = collect_file_metadata(args.files, no_archive=args.no_archive)
+    metadata, tar_path = collect_file_metadata(args.files)
     total_size = metadata["total_size"]
     # Advertise the chunking scheme so the receiver can drive completion + acking.
     chunk_size = transfer_config["chunk_size"]
@@ -1493,12 +1492,11 @@ def do_receive(args, env_config: dict):
             print(f"  Got:      {actual_checksum}", file=sys.stderr)
             logger.warning(f"Checksum mismatch! Expected: {expected_checksum}, Got: {actual_checksum}")
 
-        # Extract archive if needed
-        if file_info.get("is_archive") and (str(out_file).endswith(".tar.gz") or str(out_file).endswith(".tar")):
+        # Extract archive if needed (plain, uncompressed tar)
+        if file_info.get("is_archive") and str(out_file).endswith(".tar"):
             print("Extracting archive...", file=sys.stderr)
             try:
-                tar_mode = "r:gz" if str(out_file).endswith(".tar.gz") else "r:"
-                with tarfile.open(str(out_file), tar_mode) as tar:
+                with tarfile.open(str(out_file), "r:") as tar:
                     tar.extractall(path=str(output_dir))
                 os.unlink(str(out_file))
                 if transfer_type == "directory":
@@ -1603,7 +1601,6 @@ def build_parser() -> argparse.ArgumentParser:
                             help=f"Chunks sent before waiting for receiver ack, for flow control "
                                  f"(default: {DEFAULT_ACK_WINDOW})")
     xfer_group.add_argument("--compress", choices=list(COMPRESSION_TYPES.keys()), default=None, help="Compression")
-    xfer_group.add_argument("--no-archive", action="store_true", help="Skip gzip compression when archiving directories (use plain tar, faster for large/active dirs)")
     xfer_group.add_argument("--force-overwrite", action="store_true", help="Automatically overwrite existing files without confirmation (bypasses overwrite/rename prompt)")
 
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
