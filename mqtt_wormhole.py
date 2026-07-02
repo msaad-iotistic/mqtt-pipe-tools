@@ -66,6 +66,10 @@ MSG_ACK = "ack"
 MSG_DATA_ACK = "data_ack"  # windowed cumulative ack during data transfer
 MSG_DONE = "done"
 MSG_ERROR = "error"
+MSG_ABORT = "abort"  # peer intentionally stopped (Ctrl+C / SIGTERM)
+
+# Seconds of silence from an already-paired peer before we assume it disconnected.
+PEER_IDLE_TIMEOUT = 60
 
 
 # ─── HELPERS ────────────────────────────────────────────────────────────────
@@ -737,6 +741,31 @@ def recv_control(client: MQTTNetcat, timeout: float = 60, drain_data=None) -> Op
             drain_data.append(body)
 
 
+def peer_stopped(msg) -> bool:
+    """True if a received control message means the peer ended the transfer."""
+    return isinstance(msg, dict) and msg.get("type") in (MSG_ERROR, MSG_ABORT)
+
+
+def broker_lost(client: MQTTNetcat) -> bool:
+    """True if OUR connection to the broker dropped unexpectedly (rc != 0).
+
+    Reads the flag mqtt_cat already maintains in userdata; our own graceful
+    disconnect sets rc == 0, so this stays False during normal shutdown.
+    """
+    rc = client.userdata.get("disconnected")
+    return rc is not None and rc != 0
+
+
+def notify_abort(client: MQTTNetcat):
+    """Best-effort: tell the peer we're stopping so it doesn't hang, then give the
+    background paho loop a moment to flush the publish before we disconnect."""
+    try:
+        send_control(client, MSG_ABORT, {"message": "cancelled by user"})
+        time.sleep(0.3)
+    except Exception:
+        pass
+
+
 # ─── FILE METADATA ──────────────────────────────────────────────────────────
 
 def collect_file_metadata(paths: list):
@@ -937,13 +966,12 @@ def do_send(args, env_config: dict):
         if tar_path and os.path.exists(tar_path):
             os.unlink(tar_path)
 
-    def signal_handler(sig, frame):
-        print("\nInterrupted. Cleaning up...", file=sys.stderr)
-        cleanup()
-        sys.exit(1)
-
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    # Leave SIGINT on Python's default (raises KeyboardInterrupt, which promptly
+    # interrupts the blocking receive); funnel SIGTERM into the same path so both
+    # notify the peer via the `except KeyboardInterrupt` handler below.
+    def _sigterm(sig, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _sigterm)
 
     # Track authentication attempts across connection retries
     auth_attempts = 0
@@ -957,7 +985,16 @@ def do_send(args, env_config: dict):
         print("Waiting for receiver to connect...", file=sys.stderr)
         logger.info("Waiting for receiver READY message")
         while True:
+            if broker_lost(client):
+                print("\nError: lost connection to broker.", file=sys.stderr)
+                cleanup()
+                sys.exit(1)
             msg = recv_control(client, timeout=3600)
+            if peer_stopped(msg):
+                print(f"\nReceiver ended the transfer: {msg.get('message', 'disconnected')}",
+                      file=sys.stderr)
+                cleanup()
+                sys.exit(1)
             if msg and msg.get("type") == MSG_READY:
                 print("Receiver connected!", file=sys.stderr)
                 logger.info("Receiver connected and ready")
@@ -1061,6 +1098,10 @@ def do_send(args, env_config: dict):
 
         # Wait for ACK (receiver accepted)
         while True:
+            if broker_lost(client):
+                print("\nError: lost connection to broker.", file=sys.stderr)
+                cleanup()
+                sys.exit(1)
             msg = recv_control(client, timeout=60)
             if msg is None:
                 print("Error: Receiver did not acknowledge. Aborting.", file=sys.stderr)
@@ -1068,8 +1109,9 @@ def do_send(args, env_config: dict):
                 sys.exit(1)
             if msg.get("type") == MSG_ACK:
                 break
-            if msg.get("type") == MSG_ERROR:
-                print(f"Receiver error: {msg.get('message', 'unknown')}", file=sys.stderr)
+            if peer_stopped(msg):
+                print(f"\nReceiver ended the transfer: {msg.get('message', 'unknown')}",
+                      file=sys.stderr)
                 cleanup()
                 sys.exit(1)
 
@@ -1097,9 +1139,15 @@ def do_send(args, env_config: dict):
                     if transfer_config["qos"] == 0:
                         time.sleep(0.001)
 
+                if broker_lost(client):
+                    print("\nError: lost connection to broker.", file=sys.stderr)
+                    cleanup()
+                    sys.exit(1)
+
                 ack = recv_control(client, timeout=ACK_TIMEOUT)
-                if ack and ack.get("type") == MSG_ERROR:
-                    print(f"\nReceiver error: {ack.get('message', 'unknown')}", file=sys.stderr)
+                if peer_stopped(ack):
+                    print(f"\nReceiver ended the transfer: {ack.get('message', 'unknown')}",
+                          file=sys.stderr)
                     logger.error(f"Receiver aborted transfer: {ack.get('message')}")
                     cleanup()
                     sys.exit(1)
@@ -1150,8 +1198,9 @@ def do_send(args, env_config: dict):
             logger.warning("No final confirmation received from receiver")
 
     except KeyboardInterrupt:
-        print("\nInterrupted.", file=sys.stderr)
-        logger.info("Send interrupted by user")
+        print("\nInterrupted — notifying peer...", file=sys.stderr)
+        logger.info("Send interrupted by user; sending abort to peer")
+        notify_abort(client)
     except Exception as e:
         print(f"\nError: {e}", file=sys.stderr)
         logger.error(f"Send failed with error: {e}", exc_info=True)
@@ -1199,6 +1248,8 @@ def do_receive(args, env_config: dict):
     client = create_client("listen", code, profile, enc_config, transfer_config, verbose=args.verbose)
 
     cleanup_done = False
+    transfer_ok = False   # set True once the file is fully received + checksummed
+    out_file = None       # bound during the handshake; used for partial-file cleanup
 
     def cleanup():
         nonlocal cleanup_done
@@ -1209,14 +1260,21 @@ def do_receive(args, env_config: dict):
             client.disconnect()
         except Exception:
             pass
+        # Drop an incomplete, unverified output file on an abnormal stop.
+        if not transfer_ok and out_file is not None:
+            try:
+                if out_file.exists():
+                    out_file.unlink()
+                    logger.info(f"Removed partial file: {out_file}")
+            except OSError:
+                pass
 
-    def signal_handler(sig, frame):
-        print("\nInterrupted. Cleaning up...", file=sys.stderr)
-        cleanup()
-        sys.exit(1)
-
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    # Leave SIGINT on Python's default (raises KeyboardInterrupt, which promptly
+    # interrupts the blocking receive); funnel SIGTERM into the same path so both
+    # notify the peer via the `except KeyboardInterrupt` handler below.
+    def _sigterm(sig, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _sigterm)
 
     try:
         client.connect()
@@ -1228,18 +1286,38 @@ def do_receive(args, env_config: dict):
         last_ready = 0
         challenge_received = False
         metadata = None
+        seen_sender = False       # True once the sender has made contact
+        last_activity = time.monotonic()
 
         # Send READY until we get a response, then wait for metadata
         while metadata is None:
             now = time.monotonic()
+            if broker_lost(client):
+                print("\nError: lost connection to broker.", file=sys.stderr)
+                cleanup()
+                sys.exit(1)
             if not challenge_received and now - last_ready >= 2:
                 send_control(client, MSG_READY)
                 last_ready = now
 
             msg = recv_control(client, timeout=2)
             if msg is None:
+                # Only time out once the sender has actually shown up; before first
+                # contact we wait indefinitely for a human to start the sender.
+                if seen_sender and now - last_activity >= PEER_IDLE_TIMEOUT:
+                    print("\nError: sender not responding (disconnected?).", file=sys.stderr)
+                    cleanup()
+                    sys.exit(1)
                 continue
-                
+
+            seen_sender = True
+            last_activity = now
+            if peer_stopped(msg):
+                print(f"\nSender ended the transfer: {msg.get('message', 'disconnected')}",
+                      file=sys.stderr)
+                cleanup()
+                sys.exit(1)
+
             msg_type = msg.get("type")
             
             # Handle challenge-response authentication
@@ -1438,15 +1516,25 @@ def do_receive(args, env_config: dict):
         def send_data_ack():
             send_control(client, MSG_DATA_ACK, {"ack_seq": expected - 1, "bad": bad})
 
+        recv_timeout = 30
+        idle = 0
         with open(str(out_file), "wb") as f, make_progress_bar(total_size, desc) as pbar:
             while expected < total_chunks:
-                tag, body = recv_message(client, timeout=30)
+                if broker_lost(client):
+                    raise ConnectionError("lost connection to broker")
+                tag, body = recv_message(client, timeout=recv_timeout)
                 if tag is None:
-                    # Idle: flush an ack so a lossy/short window can't deadlock.
+                    # No data from the sender this interval. Give up if it's been
+                    # silent too long (crashed/disconnected); otherwise flush an ack
+                    # so a lossy/short window can't deadlock.
+                    idle += recv_timeout
+                    if idle >= PEER_IDLE_TIMEOUT:
+                        raise ConnectionError("sender not responding (disconnected?)")
                     send_data_ack()
                     since_ack = 0
                     bad = []
                     continue
+                idle = 0  # any traffic from the sender resets the liveness clock
                 if tag == TAG_DATA and body is not None and len(body) >= 8:
                     seq = int.from_bytes(body[0:4], "big")
                     crc = int.from_bytes(body[4:8], "big")
@@ -1468,10 +1556,9 @@ def do_receive(args, env_config: dict):
                         since_ack = 0
                         bad = []
                 elif tag == TAG_CONTROL and isinstance(body, dict):
-                    if body.get("type") == MSG_ERROR:
-                        print(f"\nSender error: {body.get('message', 'unknown')}", file=sys.stderr)
-                        cleanup()
-                        sys.exit(1)
+                    if peer_stopped(body):
+                        raise ConnectionError(
+                            f"sender ended: {body.get('message', 'disconnected')}")
                     # MSG_DONE only arrives after the sender has every chunk acked;
                     # the loop condition (expected < total_chunks) already handles exit.
 
@@ -1513,12 +1600,14 @@ def do_receive(args, env_config: dict):
 
         # Send final ACK with checksum result
         send_control(client, MSG_ACK, {"checksum_ok": checksum_ok})
+        transfer_ok = True   # complete + checksummed: keep the file
         print("Transfer complete!", file=sys.stderr)
         logger.info(f"Transfer complete, saved to: {out_file}")
 
     except KeyboardInterrupt:
-        print("\nInterrupted.", file=sys.stderr)
-        logger.info("Receive interrupted by user")
+        print("\nInterrupted — notifying peer...", file=sys.stderr)
+        logger.info("Receive interrupted by user; sending abort to peer")
+        notify_abort(client)
     except Exception as e:
         print(f"\nError: {e}", file=sys.stderr)
         logger.error(f"Receive failed with error: {e}", exc_info=True)
