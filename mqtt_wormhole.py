@@ -565,15 +565,22 @@ def wait_for_stable_path(path: Path, max_wait: float = 5.0, check_interval: floa
         return False
 
 
-def safe_tar_add(tar: tarfile.TarFile, filepath: str, arcname: str, timeout: int = 10):
-    """Add a file to tar, handling errors and timeouts for files that may block."""
+def safe_tar_add(tar: tarfile.TarFile, filepath: str, arcname: str, timeout: int = 10,
+                 recursive: bool = True):
+    """Add a file to tar, handling errors and timeouts for files that may block.
+
+    Pass recursive=False when the caller already enumerates directory contents
+    itself (e.g. via rglob) — otherwise each subdirectory would be added
+    recursively AND its children re-added individually, duplicating them in the
+    archive and bloating it well past the source size.
+    """
     def _alarm_handler(signum, frame):
         raise TimeoutError(f"Timed out reading {filepath}")
 
     old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
     signal.alarm(timeout)
     try:
-        tar.add(filepath, arcname=arcname)
+        tar.add(filepath, arcname=arcname, recursive=recursive)
     except TimeoutError:
         logger.warning(f"Timed out adding {filepath} to archive (>{timeout}s)")
         print(f"  ⚠️  Skipped (timeout): {Path(filepath).name}", file=sys.stderr)
@@ -767,11 +774,13 @@ def collect_file_metadata(paths: list, no_archive: bool = False):
         tar_fd, tar_path = tempfile.mkstemp(suffix=tar_suffix)
         os.close(tar_fd)
         with tarfile.open(tar_path, tar_mode) as tar:
-            # Add files individually so we can handle per-file errors
+            # Add entries individually (non-recursively) so we can handle per-file
+            # errors and avoid duplicating subtrees — rglob already enumerates every
+            # descendant, so recursive adds would write nested files multiple times.
             tar.add(str(dir_path), arcname=dir_path.name, recursive=False)
             for item in sorted(dir_path.rglob("*")):
                 arcname = str(Path(dir_path.name) / item.relative_to(dir_path))
-                safe_tar_add(tar, str(item), arcname)
+                safe_tar_add(tar, str(item), arcname, recursive=False)
 
         tar_size = os.path.getsize(tar_path)
         checksum = compute_sha256(tar_path)
