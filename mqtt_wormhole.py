@@ -8,7 +8,6 @@ Receive files: mqtt-wormhole
 import argparse
 import base64
 import hashlib
-import io
 import json
 import logging
 import os
@@ -19,6 +18,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import zlib
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -40,8 +40,13 @@ ENV_FILE = os.path.join(SCRIPT_DIR, ".env")
 DEFAULT_PROFILES_FILE = "/opt/config/mqtt_profiles.json"
 DEFAULT_PROFILE_NAME = "iotistic"
 DEFAULT_LOG_FILE = os.path.join(SCRIPT_DIR, "mqtt-wormhole.log")
-PROTOCOL_VERSION = "2.0"
+PROTOCOL_VERSION = "3.0"
 TOPIC_BASE = "wormhole"
+
+# Data-transfer reliability tunables
+DEFAULT_ACK_WINDOW = 64   # chunks the sender sends before waiting for a DATA_ACK
+ACK_TIMEOUT = 30          # seconds the sender waits for a window's DATA_ACK
+MAX_RETRIES = 5           # consecutive stalled windows before aborting a transfer
 
 # Logger will be configured in main
 logger = logging.getLogger("mqtt-wormhole")
@@ -58,6 +63,7 @@ MSG_ACCEPTED = "accepted"
 MSG_REJECTED = "rejected"
 MSG_METADATA = "metadata"
 MSG_ACK = "ack"
+MSG_DATA_ACK = "data_ack"  # windowed cumulative ack during data transfer
 MSG_DONE = "done"
 MSG_ERROR = "error"
 
@@ -169,6 +175,7 @@ def load_profiles_config(profiles_file: str = DEFAULT_PROFILES_FILE,
                 "encryption_iterations": "encryption_iterations",
                 "qos": "qos",
                 "chunk_size": "chunk_size",
+                "ack_window": "ack_window",
                 "compression": "compression",
             }
             for profile_key, conf_key in key_mapping.items():
@@ -220,6 +227,7 @@ def load_env_config(args=None) -> dict:
             "MQTT_ENCRYPTION_ITERATIONS": "encryption_iterations",
             "MQTT_QOS": "qos",
             "MQTT_CHUNK_SIZE": "chunk_size",
+            "MQTT_ACK_WINDOW": "ack_window",
             "MQTT_COMPRESSION": "compression",
             "MQTT_FORCE_OVERWRITE": "force_overwrite",
         }
@@ -367,11 +375,13 @@ def get_transfer_config(args, env_config: dict) -> dict:
     """Get transfer settings from args/env."""
     qos = args.qos if args.qos is not None else int(env_config.get("qos", 1))
     chunk_size = args.chunk_size or int(env_config.get("chunk_size", 65536))
+    ack_window = args.ack_window or int(env_config.get("ack_window", DEFAULT_ACK_WINDOW))
     compress = args.compress or env_config.get("compression", "deflate")
     compression_type = COMPRESSION_TYPES.get(compress, COMPRESSION_NONE)
     return {
         "qos": qos,
         "chunk_size": chunk_size,
+        "ack_window": ack_window,
         "compression_type": compression_type,
     }
 
@@ -593,6 +603,15 @@ def human_size(num_bytes: float) -> str:
     return f"{num_bytes:.1f} PB"
 
 
+def set_progress(pbar, n: int):
+    """Set a progress bar's absolute position, for tqdm or SimpleProgress."""
+    if hasattr(pbar, "set"):  # SimpleProgress
+        pbar.set(n)
+    else:  # tqdm
+        pbar.n = n
+        pbar.refresh()
+
+
 def make_progress_bar(total: int, desc: str):
     """Create a progress bar (tqdm if available, else simple fallback)."""
     if tqdm:
@@ -617,6 +636,12 @@ class SimpleProgress:
         self.desc = desc
         self.start_time = time.monotonic()
         self._last_print = 0
+
+    def set(self, n: int):
+        """Set absolute progress (used when a resend rewinds the counter)."""
+        self.current = n
+        self._last_print = 0
+        self.update(0)
 
     def update(self, n: int):
         self.current += n
@@ -659,9 +684,18 @@ def send_control(client: MQTTNetcat, msg_type: str, payload: dict = None):
     client.send(data)
 
 
-def send_data_chunk(client: MQTTNetcat, chunk: bytes):
-    """Send a tagged data chunk."""
-    client.send(bytes([TAG_DATA]) + chunk)
+def send_data_chunk(client: MQTTNetcat, seq: int, chunk: bytes):
+    """Send a tagged, sequenced, CRC-protected data chunk.
+
+    Frame: TAG_DATA(1) | seq(4, big-endian) | crc32(4, big-endian) | chunk.
+    The CRC is over the plaintext chunk; the transport (mqtt_cat) compresses and
+    encrypts the whole frame transparently, so the receiver's CRC matches after
+    decrypt/decompress and catches any silent corruption (e.g. mqtt_cat swallows
+    decompression failures).
+    """
+    crc = zlib.crc32(chunk) & 0xffffffff
+    header = bytes([TAG_DATA]) + seq.to_bytes(4, "big") + crc.to_bytes(4, "big")
+    client.send(header + chunk)
 
 
 def recv_message(client: MQTTNetcat, timeout: float = 60):
@@ -856,6 +890,11 @@ def do_send(args, env_config: dict):
     # Collect file metadata and prepare tarball if needed
     metadata, tar_path = collect_file_metadata(args.files, no_archive=args.no_archive)
     total_size = metadata["total_size"]
+    # Advertise the chunking scheme so the receiver can drive completion + acking.
+    chunk_size = transfer_config["chunk_size"]
+    metadata["chunk_size"] = chunk_size
+    metadata["total_chunks"] = -(-total_size // chunk_size)  # ceil div
+    metadata["ack_window"] = transfer_config["ack_window"]
     send_path = tar_path if tar_path else str(Path(args.files[0]).resolve())
     logger.info(f"Prepared files: {metadata['file_count']} file(s), total size: {human_size(total_size)}")
 
@@ -1026,30 +1065,71 @@ def do_send(args, env_config: dict):
                 cleanup()
                 sys.exit(1)
 
-        # Stream file data
+        # Stream file data in windows of `ack_window` chunks. After each window we
+        # wait for the receiver's cumulative DATA_ACK before sending more (flow
+        # control) and go back to the first un-acked chunk on any gap/CRC failure
+        # (go-back-N). The source is a seekable file, so a resend is just a seek —
+        # nothing needs to be buffered in memory.
         file_info = metadata["files"][0]
         desc = f"Sending {file_info['name']}"
-        chunk_size = transfer_config["chunk_size"]
-        logger.info(f"Starting file transfer: {file_info['name']} ({human_size(total_size)})")
+        window = transfer_config["ack_window"]
+        total_chunks = metadata["total_chunks"]
+        logger.info(f"Starting file transfer: {file_info['name']} ({human_size(total_size)}), "
+                    f"{total_chunks} chunk(s), window {window}")
 
+        base = 0        # first chunk not yet acknowledged by the receiver
+        retries = 0
         with open(send_path, "rb") as f, make_progress_bar(total_size, desc) as pbar:
-            while True:
-                chunk = f.read(chunk_size)
-                if not chunk:
-                    break
-                send_data_chunk(client, chunk)
-                pbar.update(len(chunk))
-                # Brief throttle for QoS 0 to avoid flooding
-                if transfer_config["qos"] == 0:
-                    time.sleep(0.001)
+            while base < total_chunks:
+                # (Re)send the current window starting at `base`.
+                f.seek(base * chunk_size)
+                for seq in range(base, min(base + window, total_chunks)):
+                    send_data_chunk(client, seq, f.read(chunk_size))
+                    # Brief throttle for QoS 0 to avoid flooding
+                    if transfer_config["qos"] == 0:
+                        time.sleep(0.001)
 
-        # Signal transfer complete
+                ack = recv_control(client, timeout=ACK_TIMEOUT)
+                if ack and ack.get("type") == MSG_ERROR:
+                    print(f"\nReceiver error: {ack.get('message', 'unknown')}", file=sys.stderr)
+                    logger.error(f"Receiver aborted transfer: {ack.get('message')}")
+                    cleanup()
+                    sys.exit(1)
+                if ack and ack.get("type") == MSG_DATA_ACK:
+                    if ack.get("bad"):
+                        logger.warning(f"Receiver reported bad chunks: {ack['bad']}")
+                    new_base = ack.get("ack_seq", -1) + 1
+                    if new_base > base:
+                        base = new_base
+                        retries = 0
+                    else:
+                        retries += 1  # no forward progress -> resend window
+                else:
+                    retries += 1      # timeout / unexpected message -> resend window
+
+                if retries > MAX_RETRIES:
+                    print(f"\nError: transfer stalled at chunk {base} after {MAX_RETRIES} retries.",
+                          file=sys.stderr)
+                    logger.error(f"Transfer stalled at chunk {base}, aborting")
+                    send_control(client, MSG_ERROR, {"message": f"stalled at chunk {base}"})
+                    cleanup()
+                    sys.exit(1)
+
+                # ponytail: progress reflects acked bytes, so a resend rewinds the bar.
+                set_progress(pbar, min(base * chunk_size, total_size))
+
+        # Signal transfer complete (only reached once every chunk is acknowledged)
         logger.info("File transfer complete, sending DONE message")
-        time.sleep(0.5)
         send_control(client, MSG_DONE)
 
-        # Wait for final confirmation
-        msg = recv_control(client, timeout=30)
+        # Wait for final confirmation, skipping any trailing windowed DATA_ACKs
+        # still in flight from the last window.
+        deadline = time.monotonic() + 30
+        msg = None
+        while time.monotonic() < deadline:
+            msg = recv_control(client, timeout=max(0.1, deadline - time.monotonic()))
+            if msg is None or msg.get("type") != MSG_DATA_ACK:
+                break
         if msg and msg.get("type") == MSG_ACK:
             if msg.get("checksum_ok"):
                 print("Transfer complete! Checksum verified.", file=sys.stderr)
@@ -1245,6 +1325,15 @@ def do_receive(args, env_config: dict):
             # Handle metadata (for non-auto-encrypt or after successful auth)
             elif msg_type == MSG_METADATA:
                 metadata = msg
+                peer_version = metadata.get("version")
+                if peer_version != PROTOCOL_VERSION:
+                    err = (f"protocol {peer_version} != {PROTOCOL_VERSION}; "
+                           f"upgrade mqtt-wormhole on both ends")
+                    send_control(client, MSG_ERROR, {"message": err})
+                    print(f"Error: {err}", file=sys.stderr)
+                    logger.error(f"Version mismatch: {err}")
+                    cleanup()
+                    sys.exit(1)
                 logger.info(f"Received metadata: {metadata['files'][0]['name']}")
                 break
 
@@ -1324,49 +1413,65 @@ def do_receive(args, env_config: dict):
         send_control(client, MSG_ACK)
         logger.info("Sent ACK, starting data reception")
 
-        # Receive data chunks
+        # Receive data chunks, streaming straight to disk. We accept a chunk only
+        # when its seq matches `expected` (in order) and its CRC checks out, so the
+        # file on disk always holds exactly chunks [0, expected) — no buffering, no
+        # reassembly, and the running hash never has to rewind. Duplicates (resends)
+        # and out-of-order chunks are dropped; the cumulative DATA_ACK tells the
+        # sender where to resume (go-back-N).
         desc = f"Receiving {file_info['name']}"
-        received_data = io.BytesIO()
-        received_bytes = 0
-        done = False
+        total_chunks = metadata.get("total_chunks", 0)
+        window = metadata.get("ack_window", DEFAULT_ACK_WINDOW)
+        expected = 0
+        since_ack = 0
+        bad = []
+        hasher = hashlib.sha256()
 
-        with make_progress_bar(total_size, desc) as pbar:
-            while not done:
-                # After first successful decrypt, we can use normal recv_message
-                # since the client's encryptor is already set to the correct key
+        def send_data_ack():
+            send_control(client, MSG_DATA_ACK, {"ack_seq": expected - 1, "bad": bad})
+
+        with open(str(out_file), "wb") as f, make_progress_bar(total_size, desc) as pbar:
+            while expected < total_chunks:
                 tag, body = recv_message(client, timeout=30)
                 if tag is None:
+                    # Idle: flush an ack so a lossy/short window can't deadlock.
+                    send_data_ack()
+                    since_ack = 0
+                    bad = []
                     continue
-                if tag == TAG_DATA and body:
-                    received_data.write(body)
-                    received_bytes += len(body)
-                    pbar.update(len(body))
+                if tag == TAG_DATA and body is not None and len(body) >= 8:
+                    seq = int.from_bytes(body[0:4], "big")
+                    crc = int.from_bytes(body[4:8], "big")
+                    data = body[8:]
+                    if (zlib.crc32(data) & 0xffffffff) != crc:
+                        print(f"\n⚠️  Chunk {seq} failed checksum, requesting resend", file=sys.stderr)
+                        logger.warning(f"Chunk {seq} CRC mismatch")
+                        bad.append(seq)
+                    elif seq == expected:
+                        f.write(data)
+                        hasher.update(data)
+                        expected += 1
+                        pbar.update(len(data))
+                    # seq < expected: duplicate resend -> ignore
+                    # seq > expected: gap -> ignore, wait for `expected` to be resent
+                    since_ack += 1
+                    if since_ack >= window:
+                        send_data_ack()
+                        since_ack = 0
+                        bad = []
                 elif tag == TAG_CONTROL and isinstance(body, dict):
-                    if body.get("type") == MSG_DONE:
-                        done = True
-                    elif body.get("type") == MSG_ERROR:
+                    if body.get("type") == MSG_ERROR:
                         print(f"\nSender error: {body.get('message', 'unknown')}", file=sys.stderr)
                         cleanup()
                         sys.exit(1)
+                    # MSG_DONE only arrives after the sender has every chunk acked;
+                    # the loop condition (expected < total_chunks) already handles exit.
 
-        # Drain any remaining data chunks that arrived after DONE
-        while True:
-            tag, body = recv_message(client, timeout=0.5)
-            if tag is None:
-                break
-            if tag == TAG_DATA and body:
-                received_data.write(body)
-                received_bytes += len(body)
+            # Acknowledge the final window so the sender's loop can finish.
+            send_data_ack()
 
-        # Verify checksum
-        received_data.seek(0)
-        h = hashlib.sha256()
-        while True:
-            block = received_data.read(65536)
-            if not block:
-                break
-            h.update(block)
-        actual_checksum = f"sha256:{h.hexdigest()}"
+        # Verify checksum (computed incrementally as chunks were written)
+        actual_checksum = f"sha256:{hasher.hexdigest()}"
         expected_checksum = file_info.get("checksum", "")
         checksum_ok = actual_checksum == expected_checksum
 
@@ -1378,15 +1483,6 @@ def do_receive(args, env_config: dict):
             print(f"  Expected: {expected_checksum}", file=sys.stderr)
             print(f"  Got:      {actual_checksum}", file=sys.stderr)
             logger.warning(f"Checksum mismatch! Expected: {expected_checksum}, Got: {actual_checksum}")
-
-        # Save file
-        received_data.seek(0)
-        with open(str(out_file), "wb") as f:
-            while True:
-                block = received_data.read(65536)
-                if not block:
-                    break
-                f.write(block)
 
         # Extract archive if needed
         if file_info.get("is_archive") and (str(out_file).endswith(".tar.gz") or str(out_file).endswith(".tar")):
@@ -1494,6 +1590,9 @@ def build_parser() -> argparse.ArgumentParser:
     xfer_group = parser.add_argument_group("Transfer")
     xfer_group.add_argument("--qos", type=int, choices=[0, 1, 2], default=None, help="QoS level (default: 1)")
     xfer_group.add_argument("--chunk-size", type=int, default=None, help="Chunk size in bytes (default: 65536)")
+    xfer_group.add_argument("--ack-window", type=int, default=None,
+                            help=f"Chunks sent before waiting for receiver ack, for flow control "
+                                 f"(default: {DEFAULT_ACK_WINDOW})")
     xfer_group.add_argument("--compress", choices=list(COMPRESSION_TYPES.keys()), default=None, help="Compression")
     xfer_group.add_argument("--no-archive", action="store_true", help="Skip gzip compression when archiving directories (use plain tar, faster for large/active dirs)")
     xfer_group.add_argument("--force-overwrite", action="store_true", help="Automatically overwrite existing files without confirmation (bypasses overwrite/rename prompt)")
