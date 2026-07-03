@@ -802,17 +802,22 @@ def collect_file_metadata(paths: list):
         tar_suffix = ".tar"
         tar_fd, tar_path = tempfile.mkstemp(suffix=tar_suffix)
         os.close(tar_fd)
-        with tarfile.open(tar_path, "w:") as tar:
-            # Add entries individually (non-recursively) so we can handle per-file
-            # errors and avoid duplicating subtrees — rglob already enumerates every
-            # descendant, so recursive adds would write nested files multiple times.
-            tar.add(str(dir_path), arcname=dir_path.name, recursive=False)
-            for item in sorted(dir_path.rglob("*")):
-                arcname = str(Path(dir_path.name) / item.relative_to(dir_path))
-                safe_tar_add(tar, str(item), arcname, recursive=False)
-
-        tar_size = os.path.getsize(tar_path)
-        checksum = compute_sha256(tar_path)
+        # Remove the partial temp archive if tarring is interrupted (Ctrl+C) or fails.
+        try:
+            with tarfile.open(tar_path, "w:") as tar:
+                # Add entries individually (non-recursively) so we can handle per-file
+                # errors and avoid duplicating subtrees — rglob already enumerates every
+                # descendant, so recursive adds would write nested files multiple times.
+                tar.add(str(dir_path), arcname=dir_path.name, recursive=False)
+                for item in sorted(dir_path.rglob("*")):
+                    arcname = str(Path(dir_path.name) / item.relative_to(dir_path))
+                    safe_tar_add(tar, str(item), arcname, recursive=False)
+            tar_size = os.path.getsize(tar_path)
+            checksum = compute_sha256(tar_path)
+        except BaseException:
+            if os.path.exists(tar_path):
+                os.unlink(tar_path)
+            raise
         tar_name = f"{dir_path.name}{tar_suffix}"
         files_meta.append({
             "name": tar_name,
@@ -839,12 +844,17 @@ def collect_file_metadata(paths: list):
         tar_suffix = ".tar"
         tar_fd, tar_path = tempfile.mkstemp(suffix=tar_suffix)
         os.close(tar_fd)
-        with tarfile.open(tar_path, "w:") as tar:
-            for rp in resolved:
-                safe_tar_add(tar, str(rp), rp.name)
-
-        tar_size = os.path.getsize(tar_path)
-        checksum = compute_sha256(tar_path)
+        # Remove the partial temp archive if tarring is interrupted (Ctrl+C) or fails.
+        try:
+            with tarfile.open(tar_path, "w:") as tar:
+                for rp in resolved:
+                    safe_tar_add(tar, str(rp), rp.name)
+            tar_size = os.path.getsize(tar_path)
+            checksum = compute_sha256(tar_path)
+        except BaseException:
+            if os.path.exists(tar_path):
+                os.unlink(tar_path)
+            raise
         files_meta.append({
             "name": f"bundle{tar_suffix}",
             "size": tar_size,
@@ -924,34 +934,12 @@ def do_send(args, env_config: dict):
     if enc_config.get("auto_encrypt"):
         logger.info(f"Auto-encryption enabled (window: {enc_config['key_window']}s)")
 
-    # Collect file metadata and prepare tarball if needed
-    metadata, tar_path = collect_file_metadata(args.files)
-    total_size = metadata["total_size"]
-    # Advertise the chunking scheme so the receiver can drive completion + acking.
-    chunk_size = transfer_config["chunk_size"]
-    metadata["chunk_size"] = chunk_size
-    metadata["total_chunks"] = -(-total_size // chunk_size)  # ceil div
-    metadata["ack_window"] = transfer_config["ack_window"]
-    send_path = tar_path if tar_path else str(Path(args.files[0]).resolve())
-    logger.info(f"Prepared files: {metadata['file_count']} file(s), total size: {human_size(total_size)}")
-
-    print(file=sys.stderr)
-    print(f"Your pairing code is: \033[1;36m{code}\033[0m", file=sys.stderr)
-    if enc_config.get("auto_encrypt"):
-        if enc_config.get("secret") == "secret123":
-            print(f"🔒 Auto-encryption: enabled (default secret)", file=sys.stderr)
-        else:
-            print(f"🔒 Auto-encryption: enabled (custom secret)", file=sys.stderr)
-    print(file=sys.stderr)
-    print(f"On the receiving end, run:", file=sys.stderr)
-    recv_cmd = build_receive_command(args, code, enc_config)
-    print(f"  \033[1m{recv_cmd}\033[0m", file=sys.stderr)
-    print(file=sys.stderr)
-
-    # Sender uses "connect" mode (publishes to prefix/listen, subscribes to prefix/connect)
-    logger.info(f"Connecting to broker: {profile.get('host', 'default')}:{profile.get('port', 1883)}")
-    client = create_client("connect", code, profile, enc_config, transfer_config, verbose=args.verbose)
-
+    # Set up before any slow/interruptible work (tarring, PBKDF2 key derivation) so a
+    # Ctrl+C during setup unwinds through the handler below instead of dumping a
+    # traceback. client/tar_path stay None until created; cleanup() tolerates that.
+    client = None
+    tar_path = None
+    connected = False
     cleanup_done = False
 
     def cleanup():
@@ -959,10 +947,11 @@ def do_send(args, env_config: dict):
         if cleanup_done:
             return
         cleanup_done = True
-        try:
-            client.disconnect()
-        except Exception:
-            pass
+        if client is not None:
+            try:
+                client.disconnect()
+            except Exception:
+                pass
         if tar_path and os.path.exists(tar_path):
             os.unlink(tar_path)
 
@@ -976,9 +965,38 @@ def do_send(args, env_config: dict):
     # Track authentication attempts across connection retries
     auth_attempts = 0
     max_attempts = 3
-    
+
     try:
+        # Collect file metadata and prepare tarball if needed
+        metadata, tar_path = collect_file_metadata(args.files)
+        total_size = metadata["total_size"]
+        # Advertise the chunking scheme so the receiver can drive completion + acking.
+        chunk_size = transfer_config["chunk_size"]
+        metadata["chunk_size"] = chunk_size
+        metadata["total_chunks"] = -(-total_size // chunk_size)  # ceil div
+        metadata["ack_window"] = transfer_config["ack_window"]
+        send_path = tar_path if tar_path else str(Path(args.files[0]).resolve())
+        logger.info(f"Prepared files: {metadata['file_count']} file(s), total size: {human_size(total_size)}")
+
+        print(file=sys.stderr)
+        print(f"Your pairing code is: \033[1;36m{code}\033[0m", file=sys.stderr)
+        if enc_config.get("auto_encrypt"):
+            if enc_config.get("secret") == "secret123":
+                print(f"🔒 Auto-encryption: enabled (default secret)", file=sys.stderr)
+            else:
+                print(f"🔒 Auto-encryption: enabled (custom secret)", file=sys.stderr)
+        print(file=sys.stderr)
+        print(f"On the receiving end, run:", file=sys.stderr)
+        recv_cmd = build_receive_command(args, code, enc_config)
+        print(f"  \033[1m{recv_cmd}\033[0m", file=sys.stderr)
+        print(file=sys.stderr)
+
+        # Sender uses "connect" mode (publishes to prefix/listen, subscribes to prefix/connect)
+        logger.info(f"Connecting to broker: {profile.get('host', 'default')}:{profile.get('port', 1883)}")
+        client = create_client("connect", code, profile, enc_config, transfer_config, verbose=args.verbose)
+
         client.connect()
+        connected = True
         time.sleep(0.5)
 
         # Wait for receiver READY
@@ -1198,9 +1216,13 @@ def do_send(args, env_config: dict):
             logger.warning("No final confirmation received from receiver")
 
     except KeyboardInterrupt:
-        print("\nInterrupted — notifying peer...", file=sys.stderr)
-        logger.info("Send interrupted by user; sending abort to peer")
-        notify_abort(client)
+        if connected:
+            print("\nInterrupted — notifying peer...", file=sys.stderr)
+            logger.info("Send interrupted by user; sending abort to peer")
+            notify_abort(client)
+        else:
+            print("\nInterrupted.", file=sys.stderr)
+            logger.info("Send interrupted by user during setup")
     except Exception as e:
         print(f"\nError: {e}", file=sys.stderr)
         logger.error(f"Send failed with error: {e}", exc_info=True)
@@ -1244,9 +1266,10 @@ def do_receive(args, env_config: dict):
             print(f"🔒 Auto-encryption: enabled (custom secret)", file=sys.stderr)
     logger.info(f"Connecting to broker: {profile.get('host', 'default')}:{profile.get('port', 1883)}")
 
-    # Receiver uses "listen" mode (publishes to prefix/connect, subscribes to prefix/listen)
-    client = create_client("listen", code, profile, enc_config, transfer_config, verbose=args.verbose)
-
+    # Set up before the slow PBKDF2 key derivation in create_client so a Ctrl+C during
+    # setup unwinds through the handler below instead of dumping a traceback.
+    client = None
+    connected = False
     cleanup_done = False
     transfer_ok = False   # set True once the file is fully received + checksummed
     out_file = None       # bound during the handshake; used for partial-file cleanup
@@ -1256,10 +1279,11 @@ def do_receive(args, env_config: dict):
         if cleanup_done:
             return
         cleanup_done = True
-        try:
-            client.disconnect()
-        except Exception:
-            pass
+        if client is not None:
+            try:
+                client.disconnect()
+            except Exception:
+                pass
         # Drop an incomplete, unverified output file on an abnormal stop.
         if not transfer_ok and out_file is not None:
             try:
@@ -1277,7 +1301,10 @@ def do_receive(args, env_config: dict):
     signal.signal(signal.SIGTERM, _sigterm)
 
     try:
+        # Receiver uses "listen" mode (publishes to prefix/connect, subscribes to prefix/listen)
+        client = create_client("listen", code, profile, enc_config, transfer_config, verbose=args.verbose)
         client.connect()
+        connected = True
         time.sleep(0.5)
 
         # Send READY and wait for challenge or metadata
@@ -1605,9 +1632,13 @@ def do_receive(args, env_config: dict):
         logger.info(f"Transfer complete, saved to: {out_file}")
 
     except KeyboardInterrupt:
-        print("\nInterrupted — notifying peer...", file=sys.stderr)
-        logger.info("Receive interrupted by user; sending abort to peer")
-        notify_abort(client)
+        if connected:
+            print("\nInterrupted — notifying peer...", file=sys.stderr)
+            logger.info("Receive interrupted by user; sending abort to peer")
+            notify_abort(client)
+        else:
+            print("\nInterrupted.", file=sys.stderr)
+            logger.info("Receive interrupted by user during setup")
     except Exception as e:
         print(f"\nError: {e}", file=sys.stderr)
         logger.error(f"Receive failed with error: {e}", exc_info=True)
