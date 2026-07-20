@@ -40,6 +40,15 @@ logger = logging.getLogger("mqtt-forward")
 TAG_CONTROL = 0x00
 TAG_DATA = 0x01
 
+# Fixed salt for the control-channel key. Unlike the data key (time-window salt,
+# negotiated per session), the control key is derived from secret+code with this
+# constant salt, so it is identical on both peers regardless of when each started.
+# That lets the encrypted handshake always bootstrap and re-authenticate even after
+# the data-channel time-window has drifted (e.g. one side restarted across a window
+# boundary), which is what lets a session recover without restarting both sides.
+# It is 17 bytes, so it never collides with an 8-byte time-window salt.
+CONTROL_SALT = b"mqtt-forward-ctrl"
+
 # Control message types
 MSG_READY = "ready"
 MSG_CHALLENGE = "challenge"
@@ -413,7 +422,7 @@ def create_client(mode: str, code: str, profile: dict, enc_config: dict,
                   transfer_config: dict, verbose: bool = False) -> MQTTNetcat:
     hashed_code = hash_code(code)
     prefix = f"{TOPIC_BASE}/{hashed_code}"
-    return MQTTNetcat(
+    client = MQTTNetcat(
         mode=mode, prefix=prefix, profile=profile,
         qos=transfer_config["qos"], chunk_size=transfer_config["chunk_size"],
         compression_type=transfer_config["compression_type"],
@@ -426,6 +435,17 @@ def create_client(mode: str, code: str, profile: dict, enc_config: dict,
         allow_fallback_encryption=True,
     )
 
+    # Auto-encryption only: install a stable control-channel key so the handshake can
+    # always bootstrap regardless of data-window drift (see CONTROL_SALT). The password
+    # (secret+code) is the same value used for the data key; only the salt differs.
+    if enc_config.get("auto_encrypt") and enc_config.get("encryption_key"):
+        client.userdata["control_encryptor"] = Encryptor(
+            password=enc_config["encryption_key"],
+            salt=CONTROL_SALT,
+            iterations=enc_config.get("encryption_iterations", 210000),
+        )
+    return client
+
 
 # ─── FRAMING ────────────────────────────────────────────────────────────────
 
@@ -434,7 +454,7 @@ def send_control(client: MQTTNetcat, msg_type: str, payload: dict = None):
     if payload:
         message.update(payload)
     data = bytes([TAG_CONTROL]) + json.dumps(message).encode()
-    client.send(data)
+    client.send(data, control=True)
 
 
 def send_data_chunk(client: MQTTNetcat, chunk: bytes, cid: int = 0):
@@ -799,6 +819,10 @@ def do_challenge_response_auth(client: MQTTNetcat, enc_config: dict, code: str,
                 logger.debug(f"Decryption failed with offset {offset}: {e}")
 
         if verified:
+            # Adopt the exact window key that decrypted the client's nonce as the
+            # session (data) key. This re-syncs the data channel on every handshake,
+            # so a reconnect after window drift recovers without restarting.
+            client.userdata["encryptor"] = encryptor
             send_control(client, MSG_ACCEPTED, {"window_offset": successful_offset})
             return True
         else:
@@ -839,13 +863,11 @@ def do_challenge_response_auth(client: MQTTNetcat, enc_config: dict, code: str,
             if auth_result.get("type") == MSG_ACCEPTED:
                 window_offset = auth_result.get("window_offset", 0)
                 logger.info(f"Authentication successful! Window offset: {window_offset}")
-                if window_offset != 0:
-                    derived_key, derived_salt = derive_time_based_key(
-                        enc_config['secret'], code, enc_config['key_window'], window_offset)
-                    salt_bytes = base64.b64decode(derived_salt)
-                    client.userdata["encryptor"] = Encryptor(
-                        password=derived_key, salt=salt_bytes,
-                        iterations=enc_config.get("encryption_iterations", 210000))
+                # Adopt the key we just proved to the server as the session (data)
+                # key. It is the window the server matched (offset only reflects the
+                # server's clock skew, not ours), so reuse this exact encryptor rather
+                # than re-deriving — that keeps both sides in sync across reconnects.
+                client.userdata["encryptor"] = encryptor
                 return True
             else:
                 logger.warning("Authentication rejected")

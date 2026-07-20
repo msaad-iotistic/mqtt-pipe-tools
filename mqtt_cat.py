@@ -369,6 +369,10 @@ class MQTTNetcat:
         }
         self.client = None
         self.receive_queue = queue.Queue()
+        # Throttle logging of undecryptable messages: a wrong-secret/stray peer on a
+        # shared topic can publish continuously, and one ERROR per message floods logs.
+        self._decrypt_fail_count = 0
+        self._decrypt_fail_last_log = 0.0
         self.running = False
         self.immediate_shutdown = False
         self.last_send_time = 0
@@ -600,10 +604,26 @@ class MQTTNetcat:
             payload = msg.payload
             compressor = userdata["compressor"]
             encryptor = userdata.get("encryptor")
+            control_encryptor = userdata.get("control_encryptor")
 
-            # Decrypt if encryption is enabled
-            if encryptor:
-                payload = encryptor.decrypt(payload, msg.topic.encode())
+            # Decrypt if encryption is enabled. In two-key mode we can't tell a data
+            # frame from a control frame until it's decrypted, so try the session key
+            # (hot path) then the stable control key. Single-key/no-encryption modes
+            # just use whichever key exists.
+            if encryptor or control_encryptor:
+                aad = msg.topic.encode()
+                decrypted = None
+                for e in (encryptor, control_encryptor):
+                    if e is None:
+                        continue
+                    try:
+                        decrypted = e.decrypt(payload, aad)
+                        break
+                    except Exception:
+                        decrypted = None
+                if decrypted is None:
+                    raise ValueError("Decryption failed: authentication tag mismatch")
+                payload = decrypted
                 self.logger.debug("Message decrypted successfully")
 
             # Decompress if compression is enabled
@@ -624,7 +644,22 @@ class MQTTNetcat:
                 self.receive_queue.put(payload)
 
         except Exception as e:
-            self.logger.error(f"Message processing error: {str(e)}")
+            msg = str(e)
+            if msg.startswith("Decryption failed"):
+                # Expected on a shared topic when a peer uses a different secret/cipher.
+                # Log the first hit clearly (catches real misconfig), then throttle to
+                # once per 60s with a dropped-message count so the journal isn't flooded.
+                self._decrypt_fail_count += 1
+                now = time.time()
+                if now - self._decrypt_fail_last_log >= 60:
+                    self.logger.warning(
+                        f"{msg} (dropped {self._decrypt_fail_count} undecryptable "
+                        "message(s) — wrong --secret or missing --force-fallback-encryption?)"
+                    )
+                    self._decrypt_fail_last_log = now
+                    self._decrypt_fail_count = 0
+            else:
+                self.logger.error(f"Message processing error: {msg}")
 
     def _on_disconnect(self, client: mqtt.Client, userdata: UserDataType, rc: int):
         """Callback when disconnected from broker"""
@@ -701,13 +736,16 @@ class MQTTNetcat:
             self.client.loop_stop()
             self.logger.info("Disconnected from broker")
 
-    def send(self, data: bytes):
+    def send(self, data: bytes, control: bool = False):
         """
         Send data to remote endpoint
 
         :param data: Bytes to send
+        :param control: encrypt with the stable control-channel key instead of the
+            (rotating/negotiated) session key. Only meaningful when a separate
+            ``control_encryptor`` is configured; otherwise the session key is used.
         """
-        self._send_data(data)
+        self._send_data(data, control=control)
 
     def receive(self, timeout: Optional[float] = None) -> Optional[bytes]:
         """
@@ -721,14 +759,18 @@ class MQTTNetcat:
         except queue.Empty:
             return None
 
-    def _send_data(self, data: bytes, retry: bool = False):
+    def _send_data(self, data: bytes, retry: bool = False, control: bool = False):
         """Publish data to MQTT broker with error handling"""
         if not self.client or not self.profile:
             self.logger.error("Cannot send data - not connected or no profile")
             return
 
         topic = self.topics["publish"]
+        # Control frames use the stable control key when one is configured; everything
+        # else (and all single-key/wormhole usage) uses the session encryptor.
         encryptor = self.userdata.get("encryptor")
+        if control:
+            encryptor = self.userdata.get("control_encryptor") or encryptor
         compressor = self.userdata["compressor"]
 
         action = "Retrying" if retry else "Sending"
