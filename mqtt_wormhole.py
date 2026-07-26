@@ -933,7 +933,7 @@ def create_client(mode: str, code: str, profile: dict, enc_config: dict,
         # here without cryptography is auto-derived and may use the stdlib fallback.
         allow_fallback_encryption=True,
         single_topic=SINGLE_TOPIC,
-        single_topic_tag=bytes.fromhex(hashed_code) if SINGLE_TOPIC else b"",
+        session_tag=bytes.fromhex(hashed_code),
         sub_topic=READ_TOPIC,
         pub_topic=WRITE_TOPIC,
     )
@@ -1803,6 +1803,9 @@ def main():
         parser.error("--read-topic and --write-topic must be used together")
     if READ_TOPIC and SINGLE_TOPIC:
         parser.error("--read-topic/--write-topic cannot be combined with --single-topic")
+    if READ_TOPIC and READ_TOPIC == WRITE_TOPIC:
+        parser.error("--read-topic and --write-topic must differ; use --single-topic "
+                     "for one shared topic")
 
     # Setup logging
     log_file = args.log_file if args.log_file else DEFAULT_LOG_FILE

@@ -439,6 +439,8 @@ def create_client(mode: str, code: str, profile: dict, enc_config: dict,
     # Single-topic mode: the topic is the prefix verbatim (one broker-allowed topic);
     # the code hash moves into a per-message routing tag instead of the topic name.
     prefix = TOPIC_BASE if SINGLE_TOPIC else f"{TOPIC_BASE}/{hashed_code}"
+    # Always hand the session tag to MQTTNetcat; it decides whether to use it
+    # (shared-topic modes) or ignore it (default mode, where the hash is in the topic).
     client = MQTTNetcat(
         mode=mode, prefix=prefix, profile=profile,
         qos=transfer_config["qos"], chunk_size=transfer_config["chunk_size"],
@@ -451,7 +453,7 @@ def create_client(mode: str, code: str, profile: dict, enc_config: dict,
         # here without cryptography is auto-derived and may use the stdlib fallback.
         allow_fallback_encryption=True,
         single_topic=SINGLE_TOPIC,
-        single_topic_tag=bytes.fromhex(hashed_code) if SINGLE_TOPIC else b"",
+        session_tag=bytes.fromhex(hashed_code),
         sub_topic=READ_TOPIC,
         pub_topic=WRITE_TOPIC,
     )
@@ -1358,6 +1360,9 @@ def main():
         parser.error("--read-topic and --write-topic must be used together")
     if READ_TOPIC and SINGLE_TOPIC:
         parser.error("--read-topic/--write-topic cannot be combined with --single-topic")
+    if READ_TOPIC and READ_TOPIC == WRITE_TOPIC:
+        parser.error("--read-topic and --write-topic must differ; use --single-topic "
+                     "for one shared topic")
 
     if args.listen and args.connect:
         parser.error("Cannot specify both --listen and --connect")

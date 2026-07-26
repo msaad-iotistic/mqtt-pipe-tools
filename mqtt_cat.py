@@ -307,7 +307,7 @@ class MQTTNetcat:
         encryption_iterations: int = 210000,
         allow_fallback_encryption: bool = False,
         single_topic: bool = False,
-        single_topic_tag: bytes = b"",
+        session_tag: bytes = b"",
         sub_topic: str = "",
         pub_topic: str = "",
     ):
@@ -354,18 +354,22 @@ class MQTTNetcat:
         # missing. Callers (wormhole/forward) set this only after gating explicit
         # user-supplied keys, so this stays True for auto-derived keys.
         self.allow_fallback_encryption = allow_fallback_encryption
-        # Single-topic mode: both peers share one topic. A plaintext routing prefix
-        # (session tag + role byte) on each message replaces the topic-name separators
-        # so we can drop other pairs' frames and our own loopback before decrypting.
-        self.single_topic = single_topic
-        self.single_topic_tag = single_topic_tag
-        self._role = 0 if mode == "listen" else 1
-        self._st_prefix = single_topic_tag + bytes([self._role])
         # Explicit per-direction topics (for brokers whose ACL grants one subscribe
         # and one publish topic). When both are set they override mode/prefix in
-        # _get_topics. Distinct topics mean no loopback, so no routing prefix needed.
+        # _get_topics.
+        self.single_topic = single_topic
         self.sub_topic = sub_topic
         self.pub_topic = pub_topic
+        self._role = 0 if mode == "listen" else 1
+        # Routing header prepended outside the encrypted blob when the topic layout
+        # can't separate frames on its own. session_tag (2B) separates sessions on a
+        # shared/reused topic (single-topic and explicit read/write modes); it's empty
+        # in default mode, where the session hash already lives in the topic name. The
+        # role byte is added only when publish==subscribe (single-topic), where a peer
+        # would otherwise receive its own publishes (loopback). See _strip_routing.
+        self.session_tag = session_tag if (single_topic or (sub_topic and pub_topic)) else b""
+        self._loopback = single_topic
+        self._route_hdr = self.session_tag + (bytes([self._role]) if self._loopback else b"")
 
         # Runtime state
         self.logger = self._setup_logging()
@@ -542,6 +546,22 @@ class MQTTNetcat:
             return {"subscribe": f"{self.prefix}/listen", "publish": f"{self.prefix}/connect"}
         return {"subscribe": f"{self.prefix}/connect", "publish": f"{self.prefix}/listen"}
 
+    def _strip_routing(self, payload: bytes) -> Optional[bytes]:
+        """Validate and strip the routing header (see __init__ / _route_hdr).
+
+        Returns the inner payload, or None if the frame isn't ours: another session's
+        tag (shared topic) or, in single-topic mode, our own loopback echo. Called only
+        when a header is present (self._route_hdr non-empty)."""
+        n = len(self.session_tag)
+        need = len(self._route_hdr)
+        if len(payload) < need:
+            return None
+        if n and payload[:n] != self.session_tag:
+            return None
+        if self._loopback and payload[n] == self._role:
+            return None
+        return payload[need:]
+
     def _setup_encryption(self):
         """Set up encryption if configured"""
         if not self.profile:
@@ -625,18 +645,13 @@ class MQTTNetcat:
 
         try:
             payload = msg.payload
-            # Single-topic mode: strip/validate the plaintext routing prefix before
-            # the normal decrypt path. Drop frames from another pairing code (tag
-            # mismatch) and our own loopback (same role) without attempting decrypt.
-            if self.single_topic:
-                n = len(self.single_topic_tag)
-                if len(payload) < n + 1:
+            # Validate/strip the routing header (shared-topic modes) before the normal
+            # decrypt path, so another session's frames and our own loopback are dropped
+            # without attempting decrypt. No-op in default mode (empty header).
+            if self._route_hdr:
+                payload = self._strip_routing(payload)
+                if payload is None:
                     return
-                if payload[:n] != self.single_topic_tag:
-                    return
-                if payload[n] == self._role:
-                    return
-                payload = payload[n + 1:]
             compressor = userdata["compressor"]
             encryptor = userdata.get("encryptor")
             control_encryptor = userdata.get("control_encryptor")
@@ -831,10 +846,10 @@ class MQTTNetcat:
                 data = encryptor.encrypt(data, topic.encode())
                 self.logger.debug(f"Encrypted payload size: {len(data)} bytes")
 
-            # Single-topic routing prefix rides outside the encrypted blob so the
-            # peer can filter foreign/loopback frames without decrypting.
-            if self.single_topic:
-                data = self._st_prefix + data
+            # Routing header rides outside the encrypted blob so the peer can filter
+            # foreign-session / loopback frames without decrypting. Empty in default mode.
+            if self._route_hdr:
+                data = self._route_hdr + data
 
             result = self.client.publish(topic, data, qos=self.qos)
 

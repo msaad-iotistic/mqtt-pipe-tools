@@ -313,11 +313,11 @@ mqtt-forward  --read-topic dev/b --write-topic dev/a --listen 2222 --code CODE
 ```
 
 The suggested command the sender/server prints already has the topics swapped, so
-you can copy-paste it as-is. `--read-topic`/`--write-topic` must be used together
-and cannot be combined with `--single-topic`. Since the two topics differ there is
-no loopback; pairs are separated by the topic names themselves, so to run multiple
-tunnels over one topic pair with `--no-auto-encrypt` give each its own topics (with
-auto-encryption on — the default — they stay separate regardless).
+you can copy-paste it as-is. `--read-topic`/`--write-topic` must be used together, must
+differ from each other (use `--single-topic` for one shared topic), and cannot be
+combined with `--single-topic`. Each message carries a small per-session tag, so you
+can run **multiple independent tunnels over the same topic pair** (different pairing
+codes) and they stay isolated — even with `--no-auto-encrypt`.
 
 ## mqtt-forward
 
