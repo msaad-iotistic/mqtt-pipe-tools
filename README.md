@@ -1,6 +1,6 @@
 # MQTT Pipe Tools
 
-Tools for piping data through MQTT brokers, including a Magic Wormhole-like file transfer utility.
+Tools for piping data through MQTT brokers, including a Magic Wormhole-like file transfer utility and a TCP tunnel (mqtt-forward).
 
 ## Quick Start
 
@@ -13,13 +13,18 @@ This will clone to `~/.local/share/mqtt-pipe-tools`, install dependencies, and c
 
 ### Usage
 ```bash
-# Send a file (generates pairing code)
-mqtt-wormhole --host broker.emqx.io myfile.pdf
+# Send a file (generates pairing code) using a built-in public broker preset
+mqtt-wormhole --broker emqx myfile.pdf
 # Output: Pairing code: 42-cosmic-dolphin
 
 # Receive on another machine
-mqtt-wormhole --host broker.emqx.io --code 42-cosmic-dolphin
+mqtt-wormhole --broker emqx --code 42-cosmic-dolphin
 ```
+
+`--broker` (`-b`) selects a built-in public broker so no config is needed:
+`emqx` (broker.emqx.io), `mosquitto` (test.mosquitto.org), `eclipse`
+(mqtt.eclipseprojects.io). You can still use `--host`/`--port` directly, or set up
+a `.env`/profile for a private broker. The same flag works for `mqtt-forward`.
 
 ## Installation
 
@@ -44,13 +49,34 @@ sudo ./install.sh         # Install system-wide
 
 The installer will:
 - Detect or create a Python virtual environment
-- Install dependencies automatically
-- Create `mqtt-wormhole` and `mqtt-cat` commands
+- Install optional packages best-effort (never required)
+- Create `mqtt-wormhole`, `mqtt-cat`, and `mqtt-forward` commands
 
-### Dependencies Only
+### Dependencies
+
+The tools run with **no pip-installed dependencies**: `paho-mqtt` is vendored under
+`_vendor/`, so they work even on minimal/embedded systems where `pip` is broken or
+absent. The following packages are **optional** enhancements:
+
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-optional.txt   # optional, never required
 ```
+
+| Package | Effect when present | Effect when absent |
+|---|---|---|
+| `cryptography` | AES-GCM encryption | Auto-encryption uses a built-in stdlib fallback; an explicit `--encryption-key` is rejected with a clear error |
+| `tqdm` | Rich progress bars | Simple text progress fallback |
+
+> **Encryption interop:** auto-encryption requires **both peers to have matching
+> `cryptography` availability**. A peer using AES-GCM and a peer using the stdlib
+> fallback cannot talk to each other — the mismatch surfaces loudly as an
+> authentication failure, never as silent corruption.
+>
+> To bridge a mismatch, force both peers onto the same scheme:
+> - `--force-fallback-encryption` — use the built-in stdlib scheme even if
+>   `cryptography` is installed (so a crypto-capable peer can talk to one without it).
+> - `--allow-insecure-encryption` — allow an explicit `--encryption-key` to use the
+>   fallback scheme when `cryptography` is missing, instead of erroring out.
 
 ## mqtt-wormhole
 
@@ -58,7 +84,7 @@ Magic Wormhole-like file transfer over MQTT. Send files between machines using m
 
 ### Features
 - **Pairing codes** like `42-cosmic-dolphin` for easy sharing
-- **Challenge-response authentication** prevents unauthorized access (v2.0)
+- **Challenge-response authentication** prevents unauthorized access
 - **Auto-encryption** enabled by default (time-based key derivation)
 - **Brute force protection** with 3-attempt limit
 - **Progress bars** with speed and ETA
@@ -110,7 +136,7 @@ mqtt-wormhole --code 42-cosmic-dolphin  # Will prompt if file exists
 mqtt-wormhole --code 42-cosmic-dolphin --force-overwrite  # Auto-overwrite without prompt
 ```
 
-### Auto-Encryption with Challenge-Response Authentication (v2.0)
+### Auto-Encryption with Challenge-Response Authentication
 
 By default, mqtt-wormhole automatically encrypts transfers when no explicit encryption key is configured. This provides security without additional setup.
 
@@ -153,7 +179,7 @@ mqtt-wormhole --no-auto-encrypt myfile.pdf
 
 **Note:** Auto-encryption is only enabled when you haven't configured `MQTT_ENCRYPTION_KEY` in your `.env` file or profiles. Explicit encryption keys always take precedence.
 
-**Breaking Change (v2.0):** The protocol has been updated with challenge-response authentication. Version 2.0 is not compatible with version 1.0 clients.
+**Protocol version:** the wire protocol is `3.0` (challenge-response auth in 2.0; windowed cumulative ACK + go-back-N retransmission in 3.0). Both peers must run the same protocol version — a mismatch is rejected at handshake, not silently.
 
 ### File Overwrite Handling
 
@@ -192,10 +218,14 @@ echo "MQTT_FORCE_OVERWRITE=true" >> .env
 
 ### Configuration
 
-Configuration is loaded in this order (first found wins):
-1. Command-line arguments
-2. `.env` file in script directory
-3. `/opt/config/mqtt_profiles.json` (profile: `iotistic`)
+Broker config is resolved in this order (first found wins):
+1. Command-line flags (`--host`, `--port`, `--username`, …)
+2. `--broker NAME` preset (bypasses `.env`/profiles; individual CLI flags still override it)
+3. `.env` file in script directory
+4. `/opt/config/mqtt_profiles.json` (profile: `iotistic`)
+
+Passing `--profiles-file` or `--profile` explicitly bypasses the `.env` file and loads
+from the profiles file directly.
 
 #### .env file
 ```bash
@@ -207,11 +237,18 @@ cp .env.example .env
 | Variable | Description |
 |----------|-------------|
 | `MQTT_HOST` | Broker hostname |
-| `MQTT_PORT` | Broker port (default: 1883) |
+| `MQTT_PORT` | Broker port (default: 1883, or 8883 with TLS) |
 | `MQTT_USERNAME` | Authentication username |
 | `MQTT_PASSWORD` | Authentication password |
 | `MQTT_TLS` | Enable TLS (true/false) |
+| `MQTT_INSECURE` | Allow insecure TLS, skip cert verification (true/false) |
+| `MQTT_CA_CERTS` | CA certificate file path |
 | `MQTT_ENCRYPTION_KEY` | Manual end-to-end encryption key (disables auto-encryption) |
+| `MQTT_ENCRYPTION_SALT` | Encryption salt (base64) |
+| `MQTT_ENCRYPTION_ITERATIONS` | PBKDF2 iterations |
+| `MQTT_QOS` | QoS level 0/1/2 (default: 1) |
+| `MQTT_CHUNK_SIZE` | Chunk size in bytes (default: 65536) |
+| `MQTT_ACK_WINDOW` | Chunks sent before waiting for a receiver ack (default: 64) |
 | `MQTT_COMPRESSION` | Compression (deflate/none) |
 | `MQTT_FORCE_OVERWRITE` | Auto-overwrite existing files without confirmation (true/false) |
 
@@ -225,7 +262,53 @@ cp .env.example .env
 **Transfer CLI options:**
 | Option | Description |
 |--------|-------------|
+| `--qos` | QoS level 0/1/2 (default: 1) |
+| `--chunk-size` | Chunk size in bytes (default: 65536) |
+| `--ack-window` | Chunks sent before waiting for a receiver ack, for flow control (default: 64) |
+| `--compress` | Compression: `none`/`deflate` |
 | `--force-overwrite` | Auto-overwrite existing files without confirmation |
+
+## mqtt-forward
+
+TCP tunnel over MQTT — expose a local TCP service (e.g. SSH) to another machine
+through an MQTT broker, no port forwarding or public IP required.
+
+### Usage
+```bash
+# Server: run where the real service lives, generates a pairing code
+mqtt-forward --connect localhost:22
+# Output: Generated pairing code: 42-cosmic-dolphin
+
+# Client: run on the machine that wants to reach it
+mqtt-forward --listen 2222 --code 42-cosmic-dolphin
+
+# Then, on the client machine:
+ssh -p 2222 localhost
+```
+
+`--broker`/`--host`/`--secret`/encryption options work the same as mqtt-wormhole.
+Additional tunnel controls:
+
+| Option | Description |
+|--------|-------------|
+| `--rate-limit` | Max bytes/sec over MQTT, e.g. `500k`, `2m` (default: `500k`) |
+| `--max-pub-rate` | Max MQTT publishes/sec (default: 10) |
+| `--max-connections` | Max concurrent TCP connections (default: 10) |
+
+### Running as a systemd service
+
+`systemd/mqtt-forward@.service` runs the `--connect` (server) side persistently —
+one instance per exposed service:
+
+```bash
+sudo cp systemd/mqtt-forward@.service /etc/systemd/system/
+sudo mkdir -p /etc/mqtt-forward
+sudo cp systemd/example.env /etc/mqtt-forward/ssh.env   # edit TARGET/CODE
+sudo systemctl enable --now mqtt-forward@ssh
+```
+
+The unit's `ExecStart` path and `User` are set for a specific machine/account —
+edit both to match your install location before enabling.
 
 ## mqtt-cat
 
