@@ -1,0 +1,17 @@
+[Unit]
+Description=MQTT forward tunnel (%i)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=3600
+StartLimitBurst=110
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/mqtt-forward/%i.env
+ExecStart=/home/msaad/.local/bin/mqtt-forward --connect ${TARGET} --code ${CODE} $EXTRA_ARGS
+Restart=on-failure
+RestartSec=30
+User=msaad
+
+[Install]
+WantedBy=multi-user.target
