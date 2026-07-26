@@ -362,6 +362,10 @@ def build_client_command(args, code: str, enc_config: dict) -> str:
     """
     parts = ["mqtt-forward", "--listen", ":PORT", "--code", code]
 
+    # Topic prefix must match on both ends (part of topic + auth AAD).
+    if args.topic_prefix != "forward":
+        parts += ["--topic-prefix", args.topic_prefix]
+
     # Broker connection — explicit CLI flags only.
     if args.broker:
         parts += ["--broker", args.broker]
@@ -1244,6 +1248,8 @@ def build_parser() -> argparse.ArgumentParser:
                               help="Max MQTT publishes/sec (default: 10)")
     tunnel_group.add_argument("--max-connections", type=int, default=10,
                               help="Max concurrent TCP connections (new connections are silently dropped above limit) (default: 10)")
+    tunnel_group.add_argument("--topic-prefix", type=str, default=TOPIC_BASE,
+                              help=f"MQTT topic namespace; both peers must match (default: {TOPIC_BASE})")
 
     broker_group = parser.add_argument_group("Broker")
     broker_group.add_argument("--broker", "-b", type=str, metavar="NAME",
@@ -1312,6 +1318,10 @@ def main():
 
     if not args.listen and not args.connect:
         parser.error("Must specify either --listen or --connect")
+
+    # Rebind the module global; create_client and the auth AAD both read it.
+    global TOPIC_BASE
+    TOPIC_BASE = args.topic_prefix
 
     if args.listen and args.connect:
         parser.error("Cannot specify both --listen and --connect")

@@ -1723,6 +1723,8 @@ def build_parser() -> argparse.ArgumentParser:
     xfer_group.add_argument("--compress", choices=list(COMPRESSION_TYPES.keys()), default=None, help="Compression")
     xfer_group.add_argument("--force-overwrite", action="store_true", help="Automatically overwrite existing files without confirmation (bypasses overwrite/rename prompt)")
 
+    parser.add_argument("--topic-prefix", type=str, default=TOPIC_BASE,
+                        help=f"MQTT topic namespace; both peers must match (default: {TOPIC_BASE})")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
     parser.add_argument("--log-file", type=str, default=None, help=f"Log file path (default: {DEFAULT_LOG_FILE})")
 
@@ -1759,6 +1761,10 @@ def setup_logging(log_file: str, verbose: bool = False):
 def main():
     parser = build_parser()
     args = parser.parse_args()
+
+    # Rebind the module global; create_client and the auth AAD both read it.
+    global TOPIC_BASE
+    TOPIC_BASE = args.topic_prefix
 
     # Setup logging
     log_file = args.log_file if args.log_file else DEFAULT_LOG_FILE
