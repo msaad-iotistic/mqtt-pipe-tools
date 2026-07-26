@@ -43,6 +43,8 @@ DEFAULT_LOG_FILE = os.path.join(SCRIPT_DIR, "mqtt-wormhole.log")
 PROTOCOL_VERSION = "3.0"
 TOPIC_BASE = "wormhole"
 SINGLE_TOPIC = False
+READ_TOPIC = ""
+WRITE_TOPIC = ""
 
 # Data-transfer reliability tunables
 DEFAULT_ACK_WINDOW = 64   # chunks the sender sends before waiting for a DATA_ACK
@@ -404,6 +406,10 @@ def build_receive_command(args, code: str, enc_config: dict) -> str:
         parts += ["--topic-prefix", args.topic_prefix]
     if args.single_topic:
         parts.append("--single-topic")
+
+    # Explicit per-direction topics: the peer's read is our write and vice-versa.
+    if args.read_topic and args.write_topic:
+        parts += ["--read-topic", args.write_topic, "--write-topic", args.read_topic]
 
     # Broker connection — explicit CLI flags only.
     if args.broker:
@@ -928,6 +934,8 @@ def create_client(mode: str, code: str, profile: dict, enc_config: dict,
         allow_fallback_encryption=True,
         single_topic=SINGLE_TOPIC,
         single_topic_tag=bytes.fromhex(hashed_code) if SINGLE_TOPIC else b"",
+        sub_topic=READ_TOPIC,
+        pub_topic=WRITE_TOPIC,
     )
 
 
@@ -1740,6 +1748,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Use one MQTT topic for both directions, for brokers that "
                              "restrict you to a single allowed topic. The topic is the "
                              "--topic-prefix value verbatim; both peers must match.")
+    parser.add_argument("--read-topic", type=str, metavar="TOPIC",
+                        help="Explicit MQTT topic to subscribe to (for brokers whose ACL "
+                             "grants a specific topic per direction). Use with --write-topic; "
+                             "the peer must swap the two (its read = your write).")
+    parser.add_argument("--write-topic", type=str, metavar="TOPIC",
+                        help="Explicit MQTT topic to publish to (see --read-topic).")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
     parser.add_argument("--log-file", type=str, default=None, help=f"Log file path (default: {DEFAULT_LOG_FILE})")
 
@@ -1778,9 +1792,17 @@ def main():
     args = parser.parse_args()
 
     # Rebind the module global; create_client and the auth AAD both read it.
-    global TOPIC_BASE, SINGLE_TOPIC
+    global TOPIC_BASE, SINGLE_TOPIC, READ_TOPIC, WRITE_TOPIC
     TOPIC_BASE = args.topic_prefix
     SINGLE_TOPIC = args.single_topic
+    READ_TOPIC = args.read_topic or ""
+    WRITE_TOPIC = args.write_topic or ""
+
+    # --read-topic/--write-topic are a pair, and can't combine with --single-topic.
+    if bool(READ_TOPIC) != bool(WRITE_TOPIC):
+        parser.error("--read-topic and --write-topic must be used together")
+    if READ_TOPIC and SINGLE_TOPIC:
+        parser.error("--read-topic/--write-topic cannot be combined with --single-topic")
 
     # Setup logging
     log_file = args.log_file if args.log_file else DEFAULT_LOG_FILE

@@ -308,6 +308,8 @@ class MQTTNetcat:
         allow_fallback_encryption: bool = False,
         single_topic: bool = False,
         single_topic_tag: bytes = b"",
+        sub_topic: str = "",
+        pub_topic: str = "",
     ):
         """
         Initialize MQTTNetcat instance
@@ -359,6 +361,11 @@ class MQTTNetcat:
         self.single_topic_tag = single_topic_tag
         self._role = 0 if mode == "listen" else 1
         self._st_prefix = single_topic_tag + bytes([self._role])
+        # Explicit per-direction topics (for brokers whose ACL grants one subscribe
+        # and one publish topic). When both are set they override mode/prefix in
+        # _get_topics. Distinct topics mean no loopback, so no routing prefix needed.
+        self.sub_topic = sub_topic
+        self.pub_topic = pub_topic
 
         # Runtime state
         self.logger = self._setup_logging()
@@ -524,6 +531,9 @@ class MQTTNetcat:
 
     def _get_topics(self) -> Dict[str, str]:
         """Determine publish/subscribe topics based on operation mode"""
+        if self.sub_topic and self.pub_topic:
+            # Explicit per-direction topics win over mode/prefix construction.
+            return {"subscribe": self.sub_topic, "publish": self.pub_topic}
         if self.single_topic:
             # Both peers share one topic; direction/pair separation moves to the
             # per-message routing prefix (see _send_data / _on_message).

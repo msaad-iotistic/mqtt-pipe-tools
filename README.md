@@ -273,6 +273,8 @@ cp .env.example .env
 |--------|-------------|
 | `--topic-prefix` | MQTT topic namespace; both peers must match (default: `wormhole` / `forward`) |
 | `--single-topic` | Use **one** MQTT topic for both directions (see below) |
+| `--read-topic` | Explicit topic to subscribe to (use with `--write-topic`; see below) |
+| `--write-topic` | Explicit topic to publish to (use with `--read-topic`) |
 
 #### Restricted brokers (single-topic mode)
 
@@ -292,6 +294,30 @@ Both peers must pass identical `--single-topic` and `--topic-prefix` (the
 suggested command the sender prints already includes them). Direction and session
 separation move into a tiny plaintext prefix on each message, so distinct pairing
 codes on the same topic stay isolated — even with `--no-auto-encrypt`.
+
+#### Restricted brokers (explicit read/write topics)
+
+The other common ACL shape grants each client one specific **subscribe** topic and
+one specific **publish** topic. Name them directly with `--read-topic` (subscribe)
+and `--write-topic` (publish). The two peers mirror each other — one side's read is
+the other's write — so **swap them on the far side**:
+
+```bash
+# Sender / server:
+mqtt-wormhole --read-topic dev/a --write-topic dev/b file.bin
+mqtt-forward  --read-topic dev/a --write-topic dev/b --connect localhost:22
+
+# Receiver / client: topics swapped (read what the other writes)
+mqtt-wormhole --read-topic dev/b --write-topic dev/a -r --code CODE
+mqtt-forward  --read-topic dev/b --write-topic dev/a --listen 2222 --code CODE
+```
+
+The suggested command the sender/server prints already has the topics swapped, so
+you can copy-paste it as-is. `--read-topic`/`--write-topic` must be used together
+and cannot be combined with `--single-topic`. Since the two topics differ there is
+no loopback; pairs are separated by the topic names themselves, so to run multiple
+tunnels over one topic pair with `--no-auto-encrypt` give each its own topics (with
+auto-encryption on — the default — they stay separate regardless).
 
 ## mqtt-forward
 
@@ -321,6 +347,7 @@ Additional tunnel controls:
 | `--max-connections` | Max concurrent TCP connections (default: 10) |
 | `--topic-prefix` | MQTT topic namespace; both peers must match (default: `forward`) |
 | `--single-topic` | Route both directions over one topic — see [Restricted brokers](#restricted-brokers-single-topic-mode) |
+| `--read-topic` / `--write-topic` | Explicit subscribe/publish topics — see [Restricted brokers](#restricted-brokers-explicit-readwrite-topics) |
 
 ### Running as a systemd service
 

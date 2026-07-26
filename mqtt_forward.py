@@ -34,6 +34,8 @@ DEFAULT_LOG_FILE = os.path.join(SCRIPT_DIR, "mqtt-forward.log")
 PROTOCOL_VERSION = "1.0"
 TOPIC_BASE = "forward"
 SINGLE_TOPIC = False
+READ_TOPIC = ""
+WRITE_TOPIC = ""
 
 logger = logging.getLogger("mqtt-forward")
 
@@ -371,6 +373,10 @@ def build_client_command(args, code: str, enc_config: dict) -> str:
     if args.single_topic:
         parts.append("--single-topic")
 
+    # Explicit per-direction topics: the peer's read is our write and vice-versa.
+    if args.read_topic and args.write_topic:
+        parts += ["--read-topic", args.write_topic, "--write-topic", args.read_topic]
+
     # Broker connection — explicit CLI flags only.
     if args.broker:
         parts += ["--broker", args.broker]
@@ -446,6 +452,8 @@ def create_client(mode: str, code: str, profile: dict, enc_config: dict,
         allow_fallback_encryption=True,
         single_topic=SINGLE_TOPIC,
         single_topic_tag=bytes.fromhex(hashed_code) if SINGLE_TOPIC else b"",
+        sub_topic=READ_TOPIC,
+        pub_topic=WRITE_TOPIC,
     )
 
     # Auto-encryption only: install a stable control-channel key so the handshake can
@@ -1263,6 +1271,12 @@ def build_parser() -> argparse.ArgumentParser:
                               help="Use one MQTT topic for both directions, for brokers that "
                                    "restrict you to a single allowed topic. The topic is the "
                                    "--topic-prefix value verbatim; both peers must match.")
+    tunnel_group.add_argument("--read-topic", type=str, metavar="TOPIC",
+                              help="Explicit MQTT topic to subscribe to (for brokers whose ACL "
+                                   "grants a specific topic per direction). Use with --write-topic; "
+                                   "the peer must swap the two (its read = your write).")
+    tunnel_group.add_argument("--write-topic", type=str, metavar="TOPIC",
+                              help="Explicit MQTT topic to publish to (see --read-topic).")
 
     broker_group = parser.add_argument_group("Broker")
     broker_group.add_argument("--broker", "-b", type=str, metavar="NAME",
@@ -1333,9 +1347,17 @@ def main():
         parser.error("Must specify either --listen or --connect")
 
     # Rebind the module global; create_client and the auth AAD both read it.
-    global TOPIC_BASE, SINGLE_TOPIC
+    global TOPIC_BASE, SINGLE_TOPIC, READ_TOPIC, WRITE_TOPIC
     TOPIC_BASE = args.topic_prefix
     SINGLE_TOPIC = args.single_topic
+    READ_TOPIC = args.read_topic or ""
+    WRITE_TOPIC = args.write_topic or ""
+
+    # --read-topic/--write-topic are a pair, and can't combine with --single-topic.
+    if bool(READ_TOPIC) != bool(WRITE_TOPIC):
+        parser.error("--read-topic and --write-topic must be used together")
+    if READ_TOPIC and SINGLE_TOPIC:
+        parser.error("--read-topic/--write-topic cannot be combined with --single-topic")
 
     if args.listen and args.connect:
         parser.error("Cannot specify both --listen and --connect")
