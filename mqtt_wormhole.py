@@ -42,6 +42,7 @@ DEFAULT_PROFILE_NAME = "iotistic"
 DEFAULT_LOG_FILE = os.path.join(SCRIPT_DIR, "mqtt-wormhole.log")
 PROTOCOL_VERSION = "3.0"
 TOPIC_BASE = "wormhole"
+SINGLE_TOPIC = False
 
 # Data-transfer reliability tunables
 DEFAULT_ACK_WINDOW = 64   # chunks the sender sends before waiting for a DATA_ACK
@@ -397,6 +398,12 @@ def build_receive_command(args, code: str, enc_config: dict) -> str:
     options (--chunk-size, --qos, --output, --force-overwrite) are omitted.
     """
     parts = ["mqtt-wormhole", "--code", code]
+
+    # Topic namespace / single-topic must match on both ends (topic + auth AAD).
+    if args.topic_prefix != "wormhole":
+        parts += ["--topic-prefix", args.topic_prefix]
+    if args.single_topic:
+        parts.append("--single-topic")
 
     # Broker connection — explicit CLI flags only.
     if args.broker:
@@ -901,7 +908,9 @@ def create_client(mode: str, code: str, profile: dict, enc_config: dict,
                   transfer_config: dict, verbose: bool = False) -> MQTTNetcat:
     """Create a single MQTTNetcat instance for the given code."""
     hashed_code = hash_code(code)
-    prefix = f"{TOPIC_BASE}/{hashed_code}"
+    # Single-topic mode: the topic is the prefix verbatim (one broker-allowed topic);
+    # the code hash moves into a per-message routing tag instead of the topic name.
+    prefix = TOPIC_BASE if SINGLE_TOPIC else f"{TOPIC_BASE}/{hashed_code}"
     return MQTTNetcat(
         mode=mode,
         prefix=prefix,
@@ -917,6 +926,8 @@ def create_client(mode: str, code: str, profile: dict, enc_config: dict,
         # Explicit keys are already gated in get_encryption_config; any key reaching
         # here without cryptography is auto-derived and may use the stdlib fallback.
         allow_fallback_encryption=True,
+        single_topic=SINGLE_TOPIC,
+        single_topic_tag=bytes.fromhex(hashed_code) if SINGLE_TOPIC else b"",
     )
 
 
@@ -1725,6 +1736,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--topic-prefix", type=str, default=TOPIC_BASE,
                         help=f"MQTT topic namespace; both peers must match (default: {TOPIC_BASE})")
+    parser.add_argument("--single-topic", action="store_true",
+                        help="Use one MQTT topic for both directions, for brokers that "
+                             "restrict you to a single allowed topic. The topic is the "
+                             "--topic-prefix value verbatim; both peers must match.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
     parser.add_argument("--log-file", type=str, default=None, help=f"Log file path (default: {DEFAULT_LOG_FILE})")
 
@@ -1763,8 +1778,9 @@ def main():
     args = parser.parse_args()
 
     # Rebind the module global; create_client and the auth AAD both read it.
-    global TOPIC_BASE
+    global TOPIC_BASE, SINGLE_TOPIC
     TOPIC_BASE = args.topic_prefix
+    SINGLE_TOPIC = args.single_topic
 
     # Setup logging
     log_file = args.log_file if args.log_file else DEFAULT_LOG_FILE

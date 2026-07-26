@@ -268,6 +268,31 @@ cp .env.example .env
 | `--compress` | Compression: `none`/`deflate` |
 | `--force-overwrite` | Auto-overwrite existing files without confirmation |
 
+**Topic CLI options** (apply to both `mqtt-wormhole` and `mqtt-forward`):
+| Option | Description |
+|--------|-------------|
+| `--topic-prefix` | MQTT topic namespace; both peers must match (default: `wormhole` / `forward`) |
+| `--single-topic` | Use **one** MQTT topic for both directions (see below) |
+
+#### Restricted brokers (single-topic mode)
+
+By default each session uses several topics under the prefix
+(`<prefix>/<code-hash>/listen` and `.../connect`). Some brokers restrict a client
+to a **single allowed topic** via ACLs, which breaks that scheme. Pass
+`--single-topic` on **both** peers to route everything over one topic — the
+`--topic-prefix` value verbatim, with no suffixes:
+
+```bash
+# Point --topic-prefix at the exact topic your broker permits:
+mqtt-wormhole --single-topic --topic-prefix myuser/tunnel file.bin      # send
+mqtt-wormhole --single-topic --topic-prefix myuser/tunnel -r --code CODE # receive
+```
+
+Both peers must pass identical `--single-topic` and `--topic-prefix` (the
+suggested command the sender prints already includes them). Direction and session
+separation move into a tiny plaintext prefix on each message, so distinct pairing
+codes on the same topic stay isolated — even with `--no-auto-encrypt`.
+
 ## mqtt-forward
 
 TCP tunnel over MQTT — expose a local TCP service (e.g. SSH) to another machine
@@ -294,6 +319,8 @@ Additional tunnel controls:
 | `--rate-limit` | Max bytes/sec over MQTT, e.g. `500k`, `2m` (default: `500k`) |
 | `--max-pub-rate` | Max MQTT publishes/sec (default: 10) |
 | `--max-connections` | Max concurrent TCP connections (default: 10) |
+| `--topic-prefix` | MQTT topic namespace; both peers must match (default: `forward`) |
+| `--single-topic` | Route both directions over one topic — see [Restricted brokers](#restricted-brokers-single-topic-mode) |
 
 ### Running as a systemd service
 

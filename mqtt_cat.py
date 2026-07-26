@@ -306,6 +306,8 @@ class MQTTNetcat:
         encryption_salt: Optional[str] = None,
         encryption_iterations: int = 210000,
         allow_fallback_encryption: bool = False,
+        single_topic: bool = False,
+        single_topic_tag: bytes = b"",
     ):
         """
         Initialize MQTTNetcat instance
@@ -350,6 +352,13 @@ class MQTTNetcat:
         # missing. Callers (wormhole/forward) set this only after gating explicit
         # user-supplied keys, so this stays True for auto-derived keys.
         self.allow_fallback_encryption = allow_fallback_encryption
+        # Single-topic mode: both peers share one topic. A plaintext routing prefix
+        # (session tag + role byte) on each message replaces the topic-name separators
+        # so we can drop other pairs' frames and our own loopback before decrypting.
+        self.single_topic = single_topic
+        self.single_topic_tag = single_topic_tag
+        self._role = 0 if mode == "listen" else 1
+        self._st_prefix = single_topic_tag + bytes([self._role])
 
         # Runtime state
         self.logger = self._setup_logging()
@@ -515,6 +524,10 @@ class MQTTNetcat:
 
     def _get_topics(self) -> Dict[str, str]:
         """Determine publish/subscribe topics based on operation mode"""
+        if self.single_topic:
+            # Both peers share one topic; direction/pair separation moves to the
+            # per-message routing prefix (see _send_data / _on_message).
+            return {"subscribe": self.prefix, "publish": self.prefix}
         if self.mode == "listen":
             return {"subscribe": f"{self.prefix}/listen", "publish": f"{self.prefix}/connect"}
         return {"subscribe": f"{self.prefix}/connect", "publish": f"{self.prefix}/listen"}
@@ -602,6 +615,18 @@ class MQTTNetcat:
 
         try:
             payload = msg.payload
+            # Single-topic mode: strip/validate the plaintext routing prefix before
+            # the normal decrypt path. Drop frames from another pairing code (tag
+            # mismatch) and our own loopback (same role) without attempting decrypt.
+            if self.single_topic:
+                n = len(self.single_topic_tag)
+                if len(payload) < n + 1:
+                    return
+                if payload[:n] != self.single_topic_tag:
+                    return
+                if payload[n] == self._role:
+                    return
+                payload = payload[n + 1:]
             compressor = userdata["compressor"]
             encryptor = userdata.get("encryptor")
             control_encryptor = userdata.get("control_encryptor")
@@ -795,6 +820,11 @@ class MQTTNetcat:
             if encryptor:
                 data = encryptor.encrypt(data, topic.encode())
                 self.logger.debug(f"Encrypted payload size: {len(data)} bytes")
+
+            # Single-topic routing prefix rides outside the encrypted blob so the
+            # peer can filter foreign/loopback frames without decrypting.
+            if self.single_topic:
+                data = self._st_prefix + data
 
             result = self.client.publish(topic, data, qos=self.qos)
 

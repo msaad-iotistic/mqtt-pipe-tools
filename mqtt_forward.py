@@ -33,6 +33,7 @@ DEFAULT_PROFILE_NAME = "iotistic"
 DEFAULT_LOG_FILE = os.path.join(SCRIPT_DIR, "mqtt-forward.log")
 PROTOCOL_VERSION = "1.0"
 TOPIC_BASE = "forward"
+SINGLE_TOPIC = False
 
 logger = logging.getLogger("mqtt-forward")
 
@@ -366,6 +367,10 @@ def build_client_command(args, code: str, enc_config: dict) -> str:
     if args.topic_prefix != "forward":
         parts += ["--topic-prefix", args.topic_prefix]
 
+    # Single-topic mode must match on both ends (shared topic + routing prefix).
+    if args.single_topic:
+        parts.append("--single-topic")
+
     # Broker connection — explicit CLI flags only.
     if args.broker:
         parts += ["--broker", args.broker]
@@ -425,7 +430,9 @@ def build_client_command(args, code: str, enc_config: dict) -> str:
 def create_client(mode: str, code: str, profile: dict, enc_config: dict,
                   transfer_config: dict, verbose: bool = False) -> MQTTNetcat:
     hashed_code = hash_code(code)
-    prefix = f"{TOPIC_BASE}/{hashed_code}"
+    # Single-topic mode: the topic is the prefix verbatim (one broker-allowed topic);
+    # the code hash moves into a per-message routing tag instead of the topic name.
+    prefix = TOPIC_BASE if SINGLE_TOPIC else f"{TOPIC_BASE}/{hashed_code}"
     client = MQTTNetcat(
         mode=mode, prefix=prefix, profile=profile,
         qos=transfer_config["qos"], chunk_size=transfer_config["chunk_size"],
@@ -437,6 +444,8 @@ def create_client(mode: str, code: str, profile: dict, enc_config: dict,
         # Explicit keys are already gated in get_encryption_config; any key reaching
         # here without cryptography is auto-derived and may use the stdlib fallback.
         allow_fallback_encryption=True,
+        single_topic=SINGLE_TOPIC,
+        single_topic_tag=bytes.fromhex(hashed_code) if SINGLE_TOPIC else b"",
     )
 
     # Auto-encryption only: install a stable control-channel key so the handshake can
@@ -1250,6 +1259,10 @@ def build_parser() -> argparse.ArgumentParser:
                               help="Max concurrent TCP connections (new connections are silently dropped above limit) (default: 10)")
     tunnel_group.add_argument("--topic-prefix", type=str, default=TOPIC_BASE,
                               help=f"MQTT topic namespace; both peers must match (default: {TOPIC_BASE})")
+    tunnel_group.add_argument("--single-topic", action="store_true",
+                              help="Use one MQTT topic for both directions, for brokers that "
+                                   "restrict you to a single allowed topic. The topic is the "
+                                   "--topic-prefix value verbatim; both peers must match.")
 
     broker_group = parser.add_argument_group("Broker")
     broker_group.add_argument("--broker", "-b", type=str, metavar="NAME",
@@ -1320,8 +1333,9 @@ def main():
         parser.error("Must specify either --listen or --connect")
 
     # Rebind the module global; create_client and the auth AAD both read it.
-    global TOPIC_BASE
+    global TOPIC_BASE, SINGLE_TOPIC
     TOPIC_BASE = args.topic_prefix
+    SINGLE_TOPIC = args.single_topic
 
     if args.listen and args.connect:
         parser.error("Cannot specify both --listen and --connect")
