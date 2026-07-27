@@ -637,6 +637,24 @@ class MQTTNetcat:
             self.logger.error(f"Connection failed with code {rc}")
             self.userdata["disconnected"] = rc
 
+    def _on_subscribe(self, client: mqtt.Client, userdata: UserDataType, mid: int, granted_qos):
+        """Detect a broker-refused subscription.
+
+        In MQTT 3.1.1 an ACL denial is NOT a connection error: the broker completes the
+        SUBSCRIBE and returns a SUBACK whose per-topic granted QoS is 0x80 (failure).
+        Without this check the client looks 'subscribed' and then waits forever for
+        messages it will never receive. On denial we log loudly and set a fatal flag so
+        the app loops stop and exit instead of hanging."""
+        if any(q == 0x80 for q in granted_qos):
+            topic = self.topics.get("subscribe", "?")
+            user = (self.profile or {}).get("username", "?")
+            reason = (f"Broker DENIED subscription to '{topic}' (SUBACK 0x80) — user "
+                      f"'{user}' is not permitted to subscribe here (broker ACL).")
+            self.logger.error(reason)
+            print(f"\n❌ {reason}", file=sys.stderr)
+            userdata["fatal_reason"] = reason
+            userdata["disconnected"] = "sub_denied"   # non-None -> app loops exit
+
     def _on_message(self, client: mqtt.Client, userdata: UserDataType, msg: mqtt.MQTTMessage):
         """Callback for received messages"""
         self.logger.debug(
@@ -745,6 +763,7 @@ class MQTTNetcat:
         # Register callbacks
         self.client.on_connect = self._on_connect
         self.client.on_message = self._on_message
+        self.client.on_subscribe = self._on_subscribe
         self.client.on_disconnect = self._on_disconnect
         self.client.on_publish = self._on_publish
 

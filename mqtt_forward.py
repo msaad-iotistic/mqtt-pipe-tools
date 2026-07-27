@@ -975,7 +975,10 @@ def do_server(args, env_config: dict):
         # Main session loop: one client at a time
         while True:
             if client.userdata.get("disconnected") is not None:
-                print("\nMQTT connection lost.", file=sys.stderr)
+                # Fatal ACL/sub errors already printed a ❌ line in mqtt_cat; only add
+                # the generic message for an ordinary broker drop.
+                if not client.userdata.get("fatal_reason"):
+                    print("\nMQTT connection lost.", file=sys.stderr)
                 break
 
             # Heartbeat + liveness while a client is attached
@@ -1155,6 +1158,13 @@ def do_client(args, env_config: dict):
         connected = False
 
         while not connected:
+            # Fatal broker error (e.g. subscription denied by ACL) — stop instead of
+            # sending READY into the void forever. mqtt_cat already printed the ❌ detail.
+            if client.userdata.get("disconnected") is not None:
+                if not client.userdata.get("fatal_reason"):
+                    print("\nMQTT connection lost.", file=sys.stderr)
+                cleanup()
+                sys.exit(1)
             now = time.monotonic()
             if not authenticated and now - last_ready >= 2:
                 send_control(client, MSG_READY, {"sid": session_id})
