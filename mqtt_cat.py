@@ -67,6 +67,13 @@ DEFAULTS = {
     "COMPRESSION_LEVEL": 0,  # 0 = no compression, 1-9 = compression levels
 }
 
+# QoS>=1 publish-ack watchdog: warn if the broker hasn't PUBACKed a publish within
+# ACK_WARN_AFTER seconds (a broker silently dropping publishes — e.g. a publish ACL —
+# or an unreachable broker shows up as acks that never arrive). Rate-limited to one
+# warning per ACK_WARN_EVERY seconds. QoS 0 has no ack, so nothing to watch.
+ACK_WARN_AFTER = 10.0
+ACK_WARN_EVERY = 30.0
+
 # MQTT error mapping
 MQTT_ERRORS = {
     mqtt.MQTT_ERR_CONN_LOST: "Broker connection lost",
@@ -393,6 +400,10 @@ class MQTTNetcat:
         # shared topic can publish continuously, and one ERROR per message floods logs.
         self._decrypt_fail_count = 0
         self._decrypt_fail_last_log = 0.0
+        # QoS>=1 publish-ack watchdog (see ACK_WARN_AFTER): mid -> monotonic send time
+        # of publishes still awaiting a broker PUBACK.
+        self._pending_acks = {}
+        self._ack_warn_last = 0.0
         self.running = False
         self.immediate_shutdown = False
         self.last_send_time = 0
@@ -741,7 +752,28 @@ class MQTTNetcat:
     def _on_publish(self, client: mqtt.Client, userdata: UserDataType, mid: int):
         """Callback when message is acknowledged by broker"""
         self.userdata["pending_count"] -= 1
+        self._pending_acks.pop(mid, None)
         self.logger.debug(f"Message acknowledged (mid: {mid})")
+
+    def _check_pending_acks(self):
+        """Warn (rate-limited) if the broker hasn't PUBACKed QoS>=1 publishes in a while.
+        A broker silently dropping publishes (e.g. a publish ACL) or an unreachable
+        broker shows up here as acks that never arrive. Advisory only — QoS>=1 acks can
+        legitimately lag — so this warns, it does not abort."""
+        if self.qos < 1 or not self._pending_acks:
+            return
+        now = time.monotonic()
+        oldest = min(self._pending_acks.values())
+        if now - oldest < ACK_WARN_AFTER or now - self._ack_warn_last < ACK_WARN_EVERY:
+            return
+        self._ack_warn_last = now
+        topic = self.topics.get("publish", "?")
+        user = (self.profile or {}).get("username", "?")
+        msg = (f"Broker has not acknowledged {len(self._pending_acks)} QoS-{self.qos} "
+               f"publish(es) to '{topic}' for {int(now - oldest)}s — it may be dropping "
+               f"messages (e.g. a publish ACL for user '{user}') or is unreachable.")
+        self.logger.warning(msg)
+        print(f"⚠️  {msg}", file=sys.stderr)
 
     def _on_log(self, client: mqtt.Client, userdata: UserDataType, level: int, buf: str):
         """Callback for MQTT client logging"""
@@ -823,6 +855,9 @@ class MQTTNetcat:
         :param timeout: Maximum time to wait in seconds (None blocks indefinitely)
         :return: Received bytes or None if timeout occurs
         """
+        # The tools poll receive() continuously, so this is a convenient heartbeat for
+        # the publish-ack watchdog (covers both retry loops and stalled transfers).
+        self._check_pending_acks()
         try:
             return self.receive_queue.get(timeout=timeout)
         except queue.Empty:
@@ -875,6 +910,7 @@ class MQTTNetcat:
             if result.rc == mqtt.MQTT_ERR_SUCCESS:
                 if self.qos > 0:
                     self.userdata["pending_count"] += 1
+                    self._pending_acks[result.mid] = time.monotonic()
                 if retry:
                     self.userdata["current_chunk"] = None  # Clear stored chunk on success
 
