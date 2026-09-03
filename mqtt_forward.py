@@ -909,7 +909,12 @@ def parse_connect_addr(addr: str) -> tuple:
 
 
 def do_server(args, env_config: dict):
-    """Server: generates code, connects to remote TCP service via MQTT tunnel."""
+    """Server: connect to a remote TCP service via the MQTT tunnel.
+
+    Returns a reason string ('stopped'/'mqtt_lost'/'fatal'/'error') so the
+    reconnect wrapper (serve_forever) can decide whether to re-establish.
+    """
+    outcome = "done"
     profile = build_profile(args, env_config)
     code = args.code or generate_code()
     enc_config = get_encryption_config(args, env_config, code)
@@ -979,6 +984,7 @@ def do_server(args, env_config: dict):
                 # the generic message for an ordinary broker drop.
                 if not client.userdata.get("fatal_reason"):
                     print("\nMQTT connection lost.", file=sys.stderr)
+                outcome = "fatal" if client.userdata.get("fatal_reason") else "mqtt_lost"
                 break
 
             # Heartbeat + liveness while a client is attached
@@ -1033,6 +1039,7 @@ def do_server(args, env_config: dict):
                 owner_sid = None
                 if reason == "mqtt_lost":
                     print("\nMQTT connection lost.", file=sys.stderr)
+                    outcome = "mqtt_lost"
                     break
                 print(f"\nSession ended ({reason}). Waiting for client to connect...",
                       file=sys.stderr)
@@ -1058,12 +1065,14 @@ def do_server(args, env_config: dict):
 
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
+        outcome = "stopped"
     except Exception as e:
         print(f"\nError: {e}", file=sys.stderr)
         logger.error(f"Server failed: {e}", exc_info=True)
-        sys.exit(1)
+        outcome = "error"
     finally:
         cleanup()
+    return outcome
 
 
 # ─── CLIENT MODE (listens locally) ──────────────────────────────────────────
@@ -1077,7 +1086,11 @@ def parse_listen_addr(addr: str) -> tuple:
 
 
 def do_client(args, env_config: dict):
-    """Client: enters code, listens on local TCP port, forwards through MQTT."""
+    """Client: listen on a local TCP port and forward it through the MQTT tunnel.
+
+    Returns a reason string so serve_forever can decide whether to reconnect.
+    """
+    outcome = "done"
     profile = build_profile(args, env_config)
     code = args.code
     if not code:
@@ -1085,10 +1098,10 @@ def do_client(args, env_config: dict):
             code = input("Enter pairing code: ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\nAborted.", file=sys.stderr)
-            sys.exit(1)
+            return "stopped"
     if not code:
         print("Error: No pairing code provided.", file=sys.stderr)
-        sys.exit(1)
+        return "config"
 
     enc_config = get_encryption_config(args, env_config, code)
     transfer_config = get_transfer_config(args, env_config)
@@ -1163,8 +1176,7 @@ def do_client(args, env_config: dict):
             if client.userdata.get("disconnected") is not None:
                 if not client.userdata.get("fatal_reason"):
                     print("\nMQTT connection lost.", file=sys.stderr)
-                cleanup()
-                sys.exit(1)
+                return "fatal" if client.userdata.get("fatal_reason") else "mqtt_lost"
             now = time.monotonic()
             if not authenticated and now - last_ready >= 2:
                 send_control(client, MSG_READY, {"sid": session_id})
@@ -1180,14 +1192,12 @@ def do_client(args, env_config: dict):
                 print("✗ Server is already serving another client. Try again later.",
                       file=sys.stderr)
                 logger.warning("Rejected by server: session busy")
-                cleanup()
-                sys.exit(1)
+                return "busy"
 
             if msg_type == MSG_BYE:
                 print("\nServer disconnected.", file=sys.stderr)
                 logger.info("Server said BYE while waiting")
-                cleanup()
-                sys.exit(1)
+                return "peer_gone"
 
             if msg_type == MSG_ACCEPTED and not authenticated:
                 # No-auth path: server skipped challenge-response (--no-auto-encrypt)
@@ -1199,8 +1209,7 @@ def do_client(args, env_config: dict):
                 print("Authenticating with server...", file=sys.stderr)
                 if not do_challenge_response_auth(client, enc_config, code, is_server=False, challenge_msg=msg):
                     print("✗ Authentication failed!", file=sys.stderr)
-                    cleanup()
-                    sys.exit(1)
+                    return "auth_failed"
                 print("✓ Authentication successful!", file=sys.stderr)
                 authenticated = True
                 monitor.reset()
@@ -1235,17 +1244,18 @@ def do_client(args, env_config: dict):
         else:
             print("\nServer disconnected.", file=sys.stderr)
         logger.info(f"Client forwarding ended ({reason})")
-        cleanup()
-        return
+        return reason if reason in ("mqtt_lost", "peer_dead") else "peer_gone"
 
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
+        outcome = "stopped"
     except Exception as e:
         print(f"\nError: {e}", file=sys.stderr)
         logger.error(f"Client failed: {e}", exc_info=True)
-        sys.exit(1)
+        outcome = "error"
     finally:
         cleanup()
+    return outcome
 
 
 # ─── CLI ────────────────────────────────────────────────────────────────────
@@ -1330,6 +1340,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
     parser.add_argument("--log-file", type=str, default=None, help=f"Log file path (default: {DEFAULT_LOG_FILE})")
 
+    rel = parser.add_argument_group("Reliability")
+    rel.add_argument("--no-reconnect", action="store_true",
+                     help="Exit on broker/tunnel drop instead of auto-reconnecting")
+    rel.add_argument("--reconnect-backoff", type=float, default=1.0,
+                     help="Initial reconnect delay in seconds (default: 1)")
+    rel.add_argument("--reconnect-max-backoff", type=float, default=30.0,
+                     help="Max reconnect delay in seconds (default: 30)")
     return parser
 
 
@@ -1349,6 +1366,43 @@ def setup_logging(log_file: str, verbose: bool = False):
         console_handler.setLevel(logging.DEBUG)
         console_handler.setFormatter(formatter)
         logger.addHandler(console_handler)
+
+
+# ─── Reconnect wrapper ───────────────────────────────────────────────────────
+
+# Reasons that mean "give up"; every other reason is a transient drop we retry.
+_TERMINAL_REASONS = {"stopped", "fatal", "auth_failed", "config", "error", "done"}
+
+
+def serve_forever(fn, args, env_config):
+    """Run do_client/do_server, reconnecting with backoff on transient drops.
+
+    A tunnel on a phone or flaky link loses its broker connection on every
+    network change; without this it would just exit. Terminal reasons (user
+    stop, wrong key, ACL denial, config error) are never retried. Returns the
+    final reason.
+    """
+    if getattr(args, "no_reconnect", False):
+        return fn(args, env_config)
+    backoff = args.reconnect_backoff
+    while True:
+        start = time.monotonic()
+        reason = fn(args, env_config)
+        if reason in _TERMINAL_REASONS:
+            return reason
+        # Reset backoff if the last session was healthy for a while, so a brief
+        # blip after hours of uptime doesn't inherit a long delay.
+        if time.monotonic() - start >= 30:
+            backoff = args.reconnect_backoff
+        print(f"\n⚠️  Tunnel dropped ({reason}); reconnecting in {int(backoff)}s "
+              f"(Ctrl-C to quit)...", file=sys.stderr)
+        logger.warning(f"Reconnecting after '{reason}' in {backoff:.0f}s")
+        try:
+            time.sleep(backoff)
+        except KeyboardInterrupt:
+            print("\nInterrupted.", file=sys.stderr)
+            return "stopped"
+        backoff = min(backoff * 2, args.reconnect_max_backoff)
 
 
 def main():
@@ -1393,9 +1447,10 @@ def main():
     env_config = load_env_config(args)
 
     if args.listen:
-        do_client(args, env_config)
+        reason = serve_forever(do_client, args, env_config)
     else:
-        do_server(args, env_config)
+        reason = serve_forever(do_server, args, env_config)
+    sys.exit(0 if reason in ("stopped", "done") else 1)
 
 
 if __name__ == "__main__":
