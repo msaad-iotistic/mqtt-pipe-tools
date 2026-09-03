@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:padding="16dp">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="MQTT Pipe — TCP tunnel (trial)"
+            android:textSize="18sp"
+            android:paddingBottom="12dp" />
+
+        <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Mode" />
+        <Spinner android:id="@+id/mode" android:layout_width="match_parent" android:layout_height="wrap_content" />
+
+        <EditText android:id="@+id/address" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:hint="address — listen: 127.0.0.1:2222   connect: host:22" android:inputType="text" />
+
+        <EditText android:id="@+id/broker" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:hint="broker preset (emqx / mosquitto / eclipse)" android:text="emqx" android:inputType="text" />
+
+        <EditText android:id="@+id/code" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:hint="pairing code (required for listen)" android:inputType="text" />
+
+        <EditText android:id="@+id/key" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:hint="encryption key (32+ chars, must match peer)" android:inputType="text" />
+
+        <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="horizontal" android:paddingTop="12dp">
+            <Button android:id="@+id/start" android:layout_width="0dp" android:layout_weight="1"
+                android:layout_height="wrap_content" android:text="Start" />
+            <Button android:id="@+id/stop" android:layout_width="0dp" android:layout_weight="1"
+                android:layout_height="wrap_content" android:text="Stop" />
+        </LinearLayout>
+
+        <TextView android:id="@+id/status" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:paddingTop="16dp" android:textIsSelectable="true" android:text="status: idle" />
+    </LinearLayout>
+</ScrollView>

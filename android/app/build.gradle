@@ -1,0 +1,57 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+    id 'com.chaquo.python'
+}
+
+android {
+    namespace 'com.iotistic.mqttpipe'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.iotistic.mqttpipe'
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName '0.1'
+
+        ndk {
+            // Real devices + the x86_64 emulator. Override with e.g.
+            //   gradle :app:assembleDebug -Pabis=arm64-v8a   (slimmer, phone-only)
+            def abis = (project.findProperty('abis') ?: 'arm64-v8a,x86_64').toString().split(',')
+            abiFilters(*abis)
+        }
+
+        python {
+            // Chaquopy uses this Python on the BUILD machine and in the app.
+            version '3.12'
+            // Optional explicit buildPython (CI/native build); Android Studio auto-detects.
+            def bp = System.getenv('CHAQUOPY_PYTHON')
+            if (bp) buildPython bp
+            pip {
+                // Prebuilt wheel from Chaquopy's repo -> AES-GCM, interoperates with
+                // desktop peers. Pin a version if the default fails to resolve.
+                install 'cryptography'
+            }
+        }
+    }
+
+    buildTypes {
+        release { minifyEnabled false }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+    kotlinOptions { jvmTarget = '1.8' }
+
+    sourceSets {
+        main { python.srcDirs = ['src/main/python'] }
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core-ktx:1.13.1'
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'com.google.android.material:material:1.12.0'
+}

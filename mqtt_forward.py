@@ -615,10 +615,12 @@ class MuxForwarder:
     READ_SIZE = 65536
 
     def __init__(self, client, monitor, args, *, listener=None,
-                 connect_addr=None, session_id=None, owner_sid=None):
+                 connect_addr=None, session_id=None, owner_sid=None,
+                 stop_event=None):
         self.client = client
         self.monitor = monitor
         self.args = args
+        self.stop_event = stop_event  # ponytail: set by embedded (Android) caller to stop; None for CLI
         self.listener = listener            # client (listen) mode
         self.connect_addr = connect_addr    # server (connect) mode
         self.session_id = session_id
@@ -758,6 +760,8 @@ class MuxForwarder:
     def run(self):
         """Service connections until the session ends. Returns a reason."""
         while True:
+            if self.stop_event is not None and self.stop_event.is_set():
+                return "stopped"
             if self.client.userdata.get("disconnected") is not None:
                 return "mqtt_lost"
             self.monitor.maybe_ping()
@@ -908,7 +912,7 @@ def parse_connect_addr(addr: str) -> tuple:
     return (host, int(port_str))
 
 
-def do_server(args, env_config: dict):
+def do_server(args, env_config: dict, stop_event=None):
     """Server: generates code, connects to remote TCP service via MQTT tunnel."""
     profile = build_profile(args, env_config)
     code = args.code or generate_code()
@@ -957,8 +961,13 @@ def do_server(args, env_config: dict):
         cleanup()
         sys.exit(1)
 
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    # ponytail: off the main thread (embedded/Android) signal.signal raises
+    # ValueError; the CLI runs on the main thread so this stays a no-op there.
+    try:
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+    except ValueError:
+        pass
 
     monitor = PeerMonitor(client)
 
@@ -974,6 +983,8 @@ def do_server(args, env_config: dict):
 
         # Main session loop: one client at a time
         while True:
+            if stop_event is not None and stop_event.is_set():
+                break
             if client.userdata.get("disconnected") is not None:
                 # Fatal ACL/sub errors already printed a ❌ line in mqtt_cat; only add
                 # the generic message for an ordinary broker drop.
@@ -1023,7 +1034,7 @@ def do_server(args, env_config: dict):
 
                 mux = MuxForwarder(client, monitor, args,
                                    connect_addr=(remote_host, remote_port),
-                                   owner_sid=owner_sid)
+                                   owner_sid=owner_sid, stop_event=stop_event)
                 try:
                     reason = mux.run()
                 finally:
@@ -1076,7 +1087,7 @@ def parse_listen_addr(addr: str) -> tuple:
     return ('0.0.0.0', int(addr))
 
 
-def do_client(args, env_config: dict):
+def do_client(args, env_config: dict, stop_event=None):
     """Client: enters code, listens on local TCP port, forwards through MQTT."""
     profile = build_profile(args, env_config)
     code = args.code
@@ -1141,8 +1152,13 @@ def do_client(args, env_config: dict):
         cleanup()
         sys.exit(1)
 
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    # ponytail: off the main thread (embedded/Android) signal.signal raises
+    # ValueError; the CLI runs on the main thread so this stays a no-op there.
+    try:
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+    except ValueError:
+        pass
 
     monitor = PeerMonitor(client)
 
@@ -1158,6 +1174,9 @@ def do_client(args, env_config: dict):
         connected = False
 
         while not connected:
+            if stop_event is not None and stop_event.is_set():
+                cleanup()
+                return
             # Fatal broker error (e.g. subscription denied by ACL) — stop instead of
             # sending READY into the void forever. mqtt_cat already printed the ❌ detail.
             if client.userdata.get("disconnected") is not None:
@@ -1222,7 +1241,8 @@ def do_client(args, env_config: dict):
         print("Tunnel ready. Forwarding (multiplexed)...", file=sys.stderr)
         logger.info("Entering multiplexed forwarding")
         mux = MuxForwarder(client, monitor, args,
-                           listener=tcp_listener, session_id=session_id)
+                           listener=tcp_listener, session_id=session_id,
+                           stop_event=stop_event)
         try:
             reason = mux.run()
         finally:

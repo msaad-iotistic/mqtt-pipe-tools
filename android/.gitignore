@@ -1,0 +1,10 @@
+/build
+/.gradle
+/app/build
+/app/.cxx
+/local.properties
+
+# Engine copied in by sync_python.sh (source of truth is the repo root) — not duplicated in git
+/app/src/main/python/mqtt_cat.py
+/app/src/main/python/mqtt_forward.py
+/app/src/main/python/_vendor/
