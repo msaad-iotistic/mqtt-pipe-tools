@@ -64,11 +64,10 @@ def _run(cfg, stop_event):
         args = mqtt_forward.build_parser().parse_args(_build_argv(cfg))
         env_config = mqtt_forward.load_env_config(args)
         _set("running", "connecting")
-        if args.listen:
-            mqtt_forward.do_client(args, env_config, stop_event=stop_event)
-        else:
-            mqtt_forward.do_server(args, env_config, stop_event=stop_event)
-        _set("stopped", "session ended")
+        fn = mqtt_forward.do_client if args.listen else mqtt_forward.do_server
+        # serve_forever adds auto-reconnect with backoff; stop_event ends it.
+        reason = mqtt_forward.serve_forever(fn, args, env_config, stop_event=stop_event)
+        _set("stopped", "ended: %s" % reason)
     except SystemExit as e:
         # do_client/do_server call sys.exit on fatal broker/ACL errors.
         _set("error", "exited (%s)" % (e.code,))

@@ -1,12 +1,16 @@
 package com.iotistic.mqttpipe
 
 import android.Manifest
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
+import android.net.Uri
+import android.provider.Settings
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
@@ -48,6 +52,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         findViewById<Button>(R.id.start).setOnClickListener {
+            ensureBatteryExemption()
             val cfg = JSONObject()
                 .put("mode", mode.selectedItem as String)
                 .put("address", address.text.toString())
@@ -67,6 +72,20 @@ class MainActivity : AppCompatActivity() {
         }
 
         pollStatus()
+    }
+
+    private fun ensureBatteryExemption() {
+        if (Build.VERSION.SDK_INT < 23) return
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        if (pm.isIgnoringBatteryOptimizations(packageName)) return
+        try {
+            startActivity(
+                Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    Uri.parse("package:$packageName"))
+            )
+        } catch (e: Exception) {
+            // Some OEM builds don't expose this intent; the FGS + WakeLock still help.
+        }
     }
 
     private fun pollStatus() {
