@@ -3,7 +3,7 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
@@ -26,6 +26,14 @@
         <service
             android:name=".TunnelService"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="specialUse">
+            <!-- Persistent userspace TCP-over-MQTT tunnel: no standard FGS type
+                 fits, and dataSync is time-limited (~6h/day) on Android 15.
+                 specialUse is exempt from that cap. Play distribution would need
+                 a justification for this subtype in the Play Console. -->
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="mqtt_tcp_tunnel" />
+        </service>
     </application>
 </manifest>
