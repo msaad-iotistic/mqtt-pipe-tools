@@ -11,10 +11,9 @@ import android.os.Looper
 import android.os.PowerManager
 import android.net.Uri
 import android.provider.Settings
-import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
-import android.widget.Spinner
+import com.google.android.material.textfield.MaterialAutoCompleteTextView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
@@ -33,11 +32,9 @@ class MainActivity : AppCompatActivity() {
 
         if (!Python.isStarted()) Python.start(AndroidPlatform(this))
 
-        val mode = findViewById<Spinner>(R.id.mode)
-        mode.adapter = ArrayAdapter(
-            this, android.R.layout.simple_spinner_dropdown_item,
-            listOf("listen", "connect")
-        )
+        val mode = findViewById<MaterialAutoCompleteTextView>(R.id.mode)
+        mode.setSimpleItems(arrayOf("listen", "connect"))
+        mode.setText("listen", false)
         val address = findViewById<EditText>(R.id.address)
         val broker = findViewById<EditText>(R.id.broker)
         val code = findViewById<EditText>(R.id.code)
@@ -54,7 +51,7 @@ class MainActivity : AppCompatActivity() {
         findViewById<Button>(R.id.start).setOnClickListener {
             ensureBatteryExemption()
             val cfg = JSONObject()
-                .put("mode", mode.selectedItem as String)
+                .put("mode", mode.text.toString())
                 .put("address", address.text.toString())
                 .put("broker", broker.text.toString())
                 .put("code", code.text.toString())
@@ -88,13 +85,22 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun statusColor(state: String): Int = when {
+        state.startsWith("run") -> 0xFF2E7D32.toInt()   // green
+        state == "error" -> 0xFFC62828.toInt()          // red
+        state == "starting" || state == "stopping" -> 0xFFF9A825.toInt()  // amber
+        else -> 0xFF9E9E9E.toInt()                       // grey
+    }
+
     private fun pollStatus() {
         ui.post(object : Runnable {
             override fun run() {
                 val json = Python.getInstance().getModule("app_bridge")
                     .callAttr("status").toString()
                 val s = JSONObject(json)
-                statusView.text = "status: ${s.optString("state")}  ${s.optString("detail")}"
+                val state = s.optString("state")
+                statusView.text = ("● " + state + "  " + s.optString("detail")).trim()
+                statusView.setTextColor(statusColor(state))
                 ui.postDelayed(this, 1000)
             }
         })
