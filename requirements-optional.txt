@@ -8,3 +8,7 @@ cryptography
 
 # Nicer file-transfer progress bars. Without it, a simple text progress fallback is used.
 tqdm
+
+# Terminal QR codes for `--qr` pairing (mobile app scans them). Without it, --qr
+# prints the payload text instead.
+qrcode
