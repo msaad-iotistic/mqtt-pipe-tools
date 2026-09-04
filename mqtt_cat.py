@@ -17,6 +17,7 @@ import threading
 import time
 import zlib  # Added for compression
 from typing import Any, Callable, Dict, Optional, TypedDict, Union
+from urllib.parse import quote, unquote
 
 try:
     import paho.mqtt.client as mqtt
@@ -38,6 +39,14 @@ try:
 except ImportError:
     HAVE_CRYPTOGRAPHY = False
 
+# qrcode is optional: `--qr` renders a scannable pairing QR in the terminal. Without
+# it, --qr prints the payload string instead.
+try:
+    import qrcode
+    HAVE_QRCODE = True
+except ImportError:
+    HAVE_QRCODE = False
+
 # When True, every Encryptor uses the stdlib fallback scheme even if cryptography is
 # installed — e.g. to interoperate with a peer that lacks cryptography. Toggle via
 # set_force_fallback(); Encryptor instances read it at construction time.
@@ -48,6 +57,49 @@ def set_force_fallback(value: bool = True):
     """Force (or unforce) the stdlib fallback encryption scheme for new Encryptors."""
     global _FORCE_FALLBACK
     _FORCE_FALLBACK = bool(value)
+
+
+# ─── QR pairing payload ──────────────────────────────────────────────────────
+# Shared wire format for pairing a mobile app by QR. The Android app builds and
+# parses the identical string, so keep the two in sync.
+PAIRING_SCHEME = "mqttpipe:"
+
+
+def build_pairing_payload(code, broker="", key=""):
+    """Encode pairing info as `mqttpipe:code=...&broker=...&key=...` (empty fields omitted)."""
+    parts = ["code=" + quote(code or "")]
+    if broker:
+        parts.append("broker=" + quote(broker))
+    if key:
+        parts.append("key=" + quote(key))
+    return PAIRING_SCHEME + "&".join(parts)
+
+
+def parse_pairing_payload(text):
+    """Inverse of build_pairing_payload. A bare string (no scheme) is treated as the code."""
+    text = (text or "").strip()
+    if not text.startswith(PAIRING_SCHEME):
+        return {"code": text}
+    out = {}
+    for kv in text[len(PAIRING_SCHEME):].split("&"):
+        if "=" in kv:
+            k, v = kv.split("=", 1)
+            out[k] = unquote(v)
+    return out
+
+
+def print_pairing_qr(code, broker="", key="", file=sys.stderr):
+    """Print a scannable QR (or the payload text if qrcode is unavailable) for the app."""
+    payload = build_pairing_payload(code, broker, key)
+    if not HAVE_QRCODE:
+        print("\U0001F4F1 Pairing payload (pip install qrcode for a scannable QR):", file=file)
+        print("   " + payload, file=file)
+        return
+    qr = qrcode.QRCode(border=1)
+    qr.add_data(payload)
+    qr.make()
+    print("\U0001F4F1 Scan to pair the mobile app:", file=file)
+    qr.print_ascii(out=file, invert=True)
 
 # Built-in public broker profiles, selectable by name (e.g. --broker emqx) so the
 # tools work out of the box with no config file. All are anonymous/no-credential.

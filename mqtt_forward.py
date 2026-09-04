@@ -23,7 +23,8 @@ from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mqtt_cat import (MQTTNetcat, COMPRESSION_TYPES, COMPRESSION_NONE, Encryptor,
-                      HAVE_CRYPTOGRAPHY, BUILTIN_PROFILES, set_force_fallback)
+                      HAVE_CRYPTOGRAPHY, BUILTIN_PROFILES, set_force_fallback,
+                      print_pairing_qr)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 WORDLIST_FILE = os.path.join(SCRIPT_DIR, "wordlist.txt")
@@ -927,6 +928,8 @@ def do_server(args, env_config: dict):
         logger.info(f"Auto-encryption enabled (window: {enc_config['key_window']}s)")
 
     print(f"Generated pairing code: {code}", file=sys.stderr)
+    if getattr(args, "qr", False):
+        print_pairing_qr(code, args.broker or "", args.encryption_key or "")
     print(f"Will connect to {remote_host}:{remote_port}", file=sys.stderr)
     if enc_config.get("auto_encrypt"):
         if enc_config.get("secret") == "secret123":
@@ -1347,6 +1350,8 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Initial reconnect delay in seconds (default: 1)")
     rel.add_argument("--reconnect-max-backoff", type=float, default=30.0,
                      help="Max reconnect delay in seconds (default: 30)")
+    parser.add_argument("--qr", action="store_true",
+                        help="Show a scannable QR of the pairing code for the mobile app")
     return parser
 
 
