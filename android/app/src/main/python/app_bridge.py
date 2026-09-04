@@ -99,3 +99,136 @@ def status():
     """Return current status as a JSON string for the UI."""
     with _lock:
         return json.dumps(_status)
+
+
+# ─── Wormhole file transfer ──────────────────────────────────────────────────
+import os
+
+import mqtt_wormhole  # copied alongside; also pulls in mqtt_cat + vendored paho
+
+_wh_thread = None
+_wh_stop = None
+_wh_lock = threading.Lock()
+_wh_status = {"state": "idle", "detail": "", "percent": 0, "file": ""}
+
+# Surface transfer progress to the UI by wrapping set_progress (do_send/do_receive
+# call it through the module global, so reassigning it here takes effect).
+_orig_set_progress = mqtt_wormhole.set_progress
+def _set_progress_hook(pbar, n):
+    _orig_set_progress(pbar, n)
+    try:
+        total = getattr(pbar, "total", 0) or 0
+        if total:
+            with _wh_lock:
+                _wh_status["percent"] = max(0, min(100, int(n * 100 / total)))
+    except Exception:
+        pass
+mqtt_wormhole.set_progress = _set_progress_hook
+
+
+def _wh_set(state, detail="", file=None):
+    with _wh_lock:
+        _wh_status["state"] = state
+        _wh_status["detail"] = detail
+        if file is not None:
+            _wh_status["file"] = file
+
+
+def _conn_args(cfg):
+    """Broker + encryption argv shared by send and receive."""
+    argv = []
+    broker = (cfg.get("broker") or "").strip()
+    if broker:
+        argv += ["--broker", broker]
+    else:
+        if cfg.get("host"):
+            argv += ["--host", cfg["host"]]
+        if cfg.get("port"):
+            argv += ["--port", str(cfg["port"])]
+        if cfg.get("username"):
+            argv += ["--username", cfg["username"]]
+        if cfg.get("password"):
+            argv += ["--password", cfg["password"]]
+        if cfg.get("tls"):
+            argv += ["--tls"]
+    if cfg.get("key"):
+        argv += ["--encryption-key", cfg["key"]]
+    return argv
+
+
+def _wh_run_send(cfg, stop_event):
+    try:
+        _wh_set("running", "sending")
+        argv = [cfg["file_path"], "--code", cfg["code"]] + _conn_args(cfg)
+        args = mqtt_wormhole.build_parser().parse_args(argv)
+        env = mqtt_wormhole.load_env_config(args)
+        mqtt_wormhole.do_send(args, env, stop_event=stop_event)
+        with _wh_lock:
+            _wh_status["percent"] = 100
+        _wh_set("done", "sent")
+    except SystemExit as e:
+        _wh_set("error", "exited (%s)" % (e.code,))
+    except BaseException as e:  # noqa: BLE001
+        _wh_set("error", "%s: %s" % (type(e).__name__, e))
+
+
+def _wh_run_receive(cfg, stop_event):
+    try:
+        _wh_set("running", "receiving")
+        out = cfg["out_dir"]
+        os.makedirs(out, exist_ok=True)
+        argv = ["--receive", "--output", out, "--code", cfg["code"],
+                "--force-overwrite"] + _conn_args(cfg)
+        args = mqtt_wormhole.build_parser().parse_args(argv)
+        env = mqtt_wormhole.load_env_config(args)
+        mqtt_wormhole.do_receive(args, env, stop_event=stop_event)
+        files = [os.path.join(out, f) for f in os.listdir(out)]
+        files = [f for f in files if os.path.isfile(f)
+                 and not f.endswith(".part") and not os.path.basename(f).startswith(".")]
+        newest = max(files, key=os.path.getmtime) if files else ""
+        with _wh_lock:
+            _wh_status["percent"] = 100
+        _wh_set("done", "received", file=newest)
+    except SystemExit as e:
+        _wh_set("error", "exited (%s)" % (e.code,))
+    except BaseException as e:  # noqa: BLE001
+        _wh_set("error", "%s: %s" % (type(e).__name__, e))
+
+
+def wormhole_new_code():
+    """A fresh pairing code (e.g. 42-cosmic-dolphin) for the send UI to show."""
+    return mqtt_wormhole.generate_code()
+
+
+def _wh_start(target, config_json):
+    global _wh_thread, _wh_stop
+    if _wh_thread is not None and _wh_thread.is_alive():
+        return False
+    cfg = json.loads(config_json)
+    _wh_stop = threading.Event()
+    with _wh_lock:
+        _wh_status.update({"state": "starting", "detail": "", "percent": 0, "file": ""})
+    _wh_thread = threading.Thread(target=target, args=(cfg, _wh_stop), daemon=True)
+    _wh_thread.start()
+    return True
+
+
+def wormhole_send(config_json):
+    """cfg: {file_path, code, broker/host..., key}. Returns True if started."""
+    return _wh_start(_wh_run_send, config_json)
+
+
+def wormhole_receive(config_json):
+    """cfg: {out_dir, code, broker/host..., key}. Returns True if started."""
+    return _wh_start(_wh_run_receive, config_json)
+
+
+def wormhole_stop():
+    if _wh_stop is not None:
+        _wh_stop.set()
+    _wh_set("stopping")
+
+
+def wh_status():
+    with _wh_lock:
+        return json.dumps(_wh_status)

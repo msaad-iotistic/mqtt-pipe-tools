@@ -22,133 +22,204 @@
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="TCP tunnel over MQTT"
+            android:text="tunnel · file transfer, over MQTT"
             android:textAppearance="?attr/textAppearanceBodyMedium"
             android:textColor="?android:attr/textColorSecondary"
-            android:paddingBottom="16dp" />
+            android:paddingBottom="8dp" />
 
-        <com.google.android.material.card.MaterialCardView
+        <com.google.android.material.tabs.TabLayout
+            android:id="@+id/tabs"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            app:cardCornerRadius="16dp"
-            app:cardElevation="0dp"
-            app:strokeWidth="1dp"
-            app:strokeColor="?attr/colorOutlineVariant">
+            app:tabMode="fixed"
+            app:tabGravity="fill" />
+
+        <!-- ============ TUNNEL PANE ============ -->
+        <LinearLayout
+            android:id="@+id/tunnelPane"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:paddingTop="16dp">
+
+            <com.google.android.material.card.MaterialCardView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                app:cardCornerRadius="16dp" app:cardElevation="0dp"
+                app:strokeWidth="1dp" app:strokeColor="?attr/colorOutlineVariant">
+                <LinearLayout
+                    android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:orientation="vertical" android:padding="16dp">
+
+                    <com.google.android.material.textfield.TextInputLayout
+                        style="@style/Widget.Material3.TextInputLayout.OutlinedBox.ExposedDropdownMenu"
+                        android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:hint="Mode">
+                        <com.google.android.material.textfield.MaterialAutoCompleteTextView
+                            android:id="@+id/mode" android:layout_width="match_parent"
+                            android:layout_height="wrap_content" android:inputType="none" />
+                    </com.google.android.material.textfield.TextInputLayout>
+
+                    <com.google.android.material.textfield.TextInputLayout
+                        style="@style/Widget.Material3.TextInputLayout.OutlinedBox"
+                        android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:layout_marginTop="12dp" android:hint="Address"
+                        app:helperText="listen: 127.0.0.1:2222   ·   connect: host:22">
+                        <com.google.android.material.textfield.TextInputEditText
+                            android:id="@+id/address" android:layout_width="match_parent"
+                            android:layout_height="wrap_content" android:inputType="text" />
+                    </com.google.android.material.textfield.TextInputLayout>
+
+                    <com.google.android.material.textfield.TextInputLayout
+                        style="@style/Widget.Material3.TextInputLayout.OutlinedBox"
+                        android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:layout_marginTop="12dp" android:hint="Broker">
+                        <com.google.android.material.textfield.TextInputEditText
+                            android:id="@+id/broker" android:layout_width="match_parent"
+                            android:layout_height="wrap_content" android:text="emqx" android:inputType="text" />
+                    </com.google.android.material.textfield.TextInputLayout>
+
+                    <com.google.android.material.textfield.TextInputLayout
+                        style="@style/Widget.Material3.TextInputLayout.OutlinedBox"
+                        android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:layout_marginTop="12dp" android:hint="Pairing code">
+                        <com.google.android.material.textfield.TextInputEditText
+                            android:id="@+id/code" android:layout_width="match_parent"
+                            android:layout_height="wrap_content" android:inputType="text" />
+                    </com.google.android.material.textfield.TextInputLayout>
+
+                    <com.google.android.material.textfield.TextInputLayout
+                        style="@style/Widget.Material3.TextInputLayout.OutlinedBox"
+                        android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:layout_marginTop="12dp" android:hint="Encryption key (32+ chars)"
+                        app:endIconMode="password_toggle">
+                        <com.google.android.material.textfield.TextInputEditText
+                            android:id="@+id/key" android:layout_width="match_parent"
+                            android:layout_height="wrap_content" android:inputType="textPassword" />
+                    </com.google.android.material.textfield.TextInputLayout>
+                </LinearLayout>
+            </com.google.android.material.card.MaterialCardView>
 
             <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:orientation="vertical"
-                android:padding="16dp">
-
-                <com.google.android.material.textfield.TextInputLayout
-                    style="@style/Widget.Material3.TextInputLayout.OutlinedBox.ExposedDropdownMenu"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:hint="Mode">
-                    <com.google.android.material.textfield.MaterialAutoCompleteTextView
-                        android:id="@+id/mode"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:inputType="none" />
-                </com.google.android.material.textfield.TextInputLayout>
-
-                <com.google.android.material.textfield.TextInputLayout
-                    style="@style/Widget.Material3.TextInputLayout.OutlinedBox"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="12dp"
-                    android:hint="Address"
-                    app:helperText="listen: 127.0.0.1:2222   ·   connect: host:22">
-                    <com.google.android.material.textfield.TextInputEditText
-                        android:id="@+id/address"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:inputType="text"
-                        android:imeOptions="actionNext" />
-                </com.google.android.material.textfield.TextInputLayout>
-
-                <com.google.android.material.textfield.TextInputLayout
-                    style="@style/Widget.Material3.TextInputLayout.OutlinedBox"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="12dp"
-                    android:hint="Broker">
-                    <com.google.android.material.textfield.TextInputEditText
-                        android:id="@+id/broker"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:text="emqx"
-                        android:inputType="text" />
-                </com.google.android.material.textfield.TextInputLayout>
-
-                <com.google.android.material.textfield.TextInputLayout
-                    style="@style/Widget.Material3.TextInputLayout.OutlinedBox"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="12dp"
-                    android:hint="Pairing code">
-                    <com.google.android.material.textfield.TextInputEditText
-                        android:id="@+id/code"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:inputType="text" />
-                </com.google.android.material.textfield.TextInputLayout>
-
-                <com.google.android.material.textfield.TextInputLayout
-                    style="@style/Widget.Material3.TextInputLayout.OutlinedBox"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="12dp"
-                    android:hint="Encryption key (32+ chars)"
-                    app:endIconMode="password_toggle">
-                    <com.google.android.material.textfield.TextInputEditText
-                        android:id="@+id/key"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:inputType="textPassword" />
-                </com.google.android.material.textfield.TextInputLayout>
+                android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:orientation="horizontal" android:layout_marginTop="16dp">
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/start" android:layout_width="0dp" android:layout_weight="1"
+                    android:layout_height="wrap_content" android:text="Start"
+                    app:icon="@android:drawable/ic_media_play" />
+                <Space android:layout_width="12dp" android:layout_height="wrap_content" />
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/stop" style="@style/Widget.Material3.Button.OutlinedButton"
+                    android:layout_width="0dp" android:layout_weight="1"
+                    android:layout_height="wrap_content" android:text="Stop" />
             </LinearLayout>
-        </com.google.android.material.card.MaterialCardView>
 
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:orientation="horizontal"
-            android:layout_marginTop="16dp">
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/start"
-                android:layout_width="0dp"
-                android:layout_weight="1"
-                android:layout_height="wrap_content"
-                android:text="Start"
-                app:icon="@android:drawable/ic_media_play" />
-            <Space android:layout_width="12dp" android:layout_height="wrap_content" />
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/stop"
-                style="@style/Widget.Material3.Button.OutlinedButton"
-                android:layout_width="0dp"
-                android:layout_weight="1"
-                android:layout_height="wrap_content"
-                android:text="Stop" />
+            <com.google.android.material.card.MaterialCardView
+                android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:layout_marginTop="16dp" app:cardCornerRadius="16dp" app:cardElevation="0dp"
+                app:strokeWidth="1dp" app:strokeColor="?attr/colorOutlineVariant">
+                <TextView android:id="@+id/status" android:layout_width="match_parent"
+                    android:layout_height="wrap_content" android:padding="16dp"
+                    android:textAppearance="?attr/textAppearanceBodyLarge"
+                    android:textIsSelectable="true" android:text="● idle" />
+            </com.google.android.material.card.MaterialCardView>
         </LinearLayout>
 
-        <com.google.android.material.card.MaterialCardView
+        <!-- ============ FILES PANE ============ -->
+        <LinearLayout
+            android:id="@+id/filesPane"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
-            app:cardCornerRadius="16dp"
-            app:cardElevation="0dp"
-            app:strokeWidth="1dp"
-            app:strokeColor="?attr/colorOutlineVariant">
-            <TextView
-                android:id="@+id/status"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:padding="16dp"
-                android:textAppearance="?attr/textAppearanceBodyLarge"
-                android:textIsSelectable="true"
-                android:text="● idle" />
-        </com.google.android.material.card.MaterialCardView>
+            android:orientation="vertical"
+            android:visibility="gone"
+            android:paddingTop="16dp">
+
+            <com.google.android.material.card.MaterialCardView
+                android:layout_width="match_parent" android:layout_height="wrap_content"
+                app:cardCornerRadius="16dp" app:cardElevation="0dp"
+                app:strokeWidth="1dp" app:strokeColor="?attr/colorOutlineVariant">
+                <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:orientation="vertical" android:padding="16dp">
+                    <com.google.android.material.textfield.TextInputLayout
+                        style="@style/Widget.Material3.TextInputLayout.OutlinedBox"
+                        android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:hint="Broker">
+                        <com.google.android.material.textfield.TextInputEditText
+                            android:id="@+id/whBroker" android:layout_width="match_parent"
+                            android:layout_height="wrap_content" android:text="emqx" android:inputType="text" />
+                    </com.google.android.material.textfield.TextInputLayout>
+                    <com.google.android.material.textfield.TextInputLayout
+                        style="@style/Widget.Material3.TextInputLayout.OutlinedBox"
+                        android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:layout_marginTop="12dp" android:hint="Encryption key (32+ chars)"
+                        app:endIconMode="password_toggle">
+                        <com.google.android.material.textfield.TextInputEditText
+                            android:id="@+id/whKey" android:layout_width="match_parent"
+                            android:layout_height="wrap_content" android:inputType="textPassword" />
+                    </com.google.android.material.textfield.TextInputLayout>
+                </LinearLayout>
+            </com.google.android.material.card.MaterialCardView>
+
+            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:layout_marginTop="16dp" android:text="Send"
+                android:textAppearance="?attr/textAppearanceTitleMedium" />
+            <com.google.android.material.card.MaterialCardView
+                android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:layout_marginTop="8dp" app:cardCornerRadius="16dp" app:cardElevation="0dp"
+                app:strokeWidth="1dp" app:strokeColor="?attr/colorOutlineVariant">
+                <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:orientation="vertical" android:padding="16dp">
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/pickFile"
+                        style="@style/Widget.Material3.Button.TonalButton"
+                        android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:text="Pick file…" app:icon="@android:drawable/ic_menu_add" />
+                    <TextView android:id="@+id/fileName" android:layout_width="match_parent"
+                        android:layout_height="wrap_content" android:layout_marginTop="8dp"
+                        android:textColor="?android:attr/textColorSecondary" android:text="No file selected" />
+                    <TextView android:id="@+id/sendCode" android:layout_width="match_parent"
+                        android:layout_height="wrap_content" android:layout_marginTop="8dp"
+                        android:textAppearance="?attr/textAppearanceHeadlineSmall"
+                        android:textIsSelectable="true" android:visibility="gone" />
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/whSend" android:layout_width="match_parent"
+                        android:layout_height="wrap_content" android:layout_marginTop="8dp"
+                        android:enabled="false" android:text="Send"
+                        app:icon="@android:drawable/ic_menu_upload" />
+                </LinearLayout>
+            </com.google.android.material.card.MaterialCardView>
+
+            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+                android:layout_marginTop="16dp" android:text="Receive"
+                android:textAppearance="?attr/textAppearanceTitleMedium" />
+            <com.google.android.material.card.MaterialCardView
+                android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:layout_marginTop="8dp" app:cardCornerRadius="16dp" app:cardElevation="0dp"
+                app:strokeWidth="1dp" app:strokeColor="?attr/colorOutlineVariant">
+                <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:orientation="vertical" android:padding="16dp">
+                    <com.google.android.material.textfield.TextInputLayout
+                        style="@style/Widget.Material3.TextInputLayout.OutlinedBox"
+                        android:layout_width="match_parent" android:layout_height="wrap_content"
+                        android:hint="Pairing code">
+                        <com.google.android.material.textfield.TextInputEditText
+                            android:id="@+id/whRecvCode" android:layout_width="match_parent"
+                            android:layout_height="wrap_content" android:inputType="text" />
+                    </com.google.android.material.textfield.TextInputLayout>
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/whReceive" android:layout_width="match_parent"
+                        android:layout_height="wrap_content" android:layout_marginTop="8dp"
+                        android:text="Receive" app:icon="@android:drawable/ic_menu_save" />
+                </LinearLayout>
+            </com.google.android.material.card.MaterialCardView>
+
+            <com.google.android.material.progressindicator.LinearProgressIndicator
+                android:id="@+id/whProgress" android:layout_width="match_parent"
+                android:layout_height="wrap_content" android:layout_marginTop="16dp"
+                android:visibility="gone" app:indicatorColor="?attr/colorPrimary" />
+            <TextView android:id="@+id/whStatus" android:layout_width="match_parent"
+                android:layout_height="wrap_content" android:layout_marginTop="8dp"
+                android:textIsSelectable="true" android:text="" />
+        </LinearLayout>
     </LinearLayout>
 </ScrollView>

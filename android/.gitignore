@@ -8,3 +8,4 @@
 /app/src/main/python/mqtt_cat.py
 /app/src/main/python/mqtt_forward.py
 /app/src/main/python/_vendor/
+/app/src/main/python/mqtt_wormhole.py

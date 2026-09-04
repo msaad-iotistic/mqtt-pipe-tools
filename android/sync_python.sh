@@ -4,6 +4,6 @@
 set -e
 here="$(cd "$(dirname "$0")" && pwd)"; root="$(cd "$here/.." && pwd)"
 dst="$here/app/src/main/python"
-cp "$root/mqtt_cat.py" "$root/mqtt_forward.py" "$dst/"
+cp "$root/mqtt_cat.py" "$root/mqtt_forward.py" "$root/mqtt_wormhole.py" "$dst/"
 rm -rf "$dst/_vendor"; cp -r "$root/_vendor" "$dst/_vendor"
 echo "synced mqtt_cat.py, mqtt_forward.py, _vendor -> $dst"

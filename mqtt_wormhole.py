@@ -594,8 +594,16 @@ def safe_tar_add(tar: tarfile.TarFile, filepath: str, arcname: str, timeout: int
     def _alarm_handler(signum, frame):
         raise TimeoutError(f"Timed out reading {filepath}")
 
-    old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
-    signal.alarm(timeout)
+    # ponytail: SIGALRM only works on the main thread; off it (embedded/Android)
+    # skip the alarm-based timeout and just add the file.
+    have_alarm = False
+    old_handler = None
+    try:
+        old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
+        signal.alarm(timeout)
+        have_alarm = True
+    except (ValueError, AttributeError):
+        pass
     try:
         tar.add(filepath, arcname=arcname, recursive=recursive)
     except TimeoutError:
@@ -605,8 +613,9 @@ def safe_tar_add(tar: tarfile.TarFile, filepath: str, arcname: str, timeout: int
         logger.warning(f"Skipped file {filepath}: {e}")
         print(f"  ⚠️  Skipped: {Path(filepath).name} ({e})", file=sys.stderr)
     finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, old_handler)
+        if have_alarm:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
 
 
 def compute_sha256(filepath: str) -> str:
@@ -941,7 +950,7 @@ def create_client(mode: str, code: str, profile: dict, enc_config: dict,
 
 # ─── SEND MODE ──────────────────────────────────────────────────────────────
 
-def do_send(args, env_config: dict):
+def do_send(args, env_config: dict, stop_event=None):
     """Handle sending files."""
     profile = build_profile(args, env_config)
     
@@ -979,7 +988,10 @@ def do_send(args, env_config: dict):
     # notify the peer via the `except KeyboardInterrupt` handler below.
     def _sigterm(sig, frame):
         raise KeyboardInterrupt
-    signal.signal(signal.SIGTERM, _sigterm)
+    try:
+        signal.signal(signal.SIGTERM, _sigterm)
+    except ValueError:
+        pass  # ponytail: off main thread (embedded/Android)
 
     # Track authentication attempts across connection retries
     auth_attempts = 0
@@ -1168,6 +1180,8 @@ def do_send(args, env_config: dict):
         retries = 0
         with open(send_path, "rb") as f, make_progress_bar(total_size, desc) as pbar:
             while base < total_chunks:
+                if stop_event is not None and stop_event.is_set():
+                    raise KeyboardInterrupt
                 # (Re)send the current window starting at `base`.
                 f.seek(base * chunk_size)
                 for seq in range(base, min(base + window, total_chunks)):
@@ -1252,7 +1266,7 @@ def do_send(args, env_config: dict):
 
 # ─── RECEIVE MODE ───────────────────────────────────────────────────────────
 
-def do_receive(args, env_config: dict):
+def do_receive(args, env_config: dict, stop_event=None):
     """Handle receiving files."""
     profile = build_profile(args, env_config)
     
@@ -1317,7 +1331,10 @@ def do_receive(args, env_config: dict):
     # notify the peer via the `except KeyboardInterrupt` handler below.
     def _sigterm(sig, frame):
         raise KeyboardInterrupt
-    signal.signal(signal.SIGTERM, _sigterm)
+    try:
+        signal.signal(signal.SIGTERM, _sigterm)
+    except ValueError:
+        pass  # ponytail: off main thread (embedded/Android)
 
     try:
         # Receiver uses "listen" mode (publishes to prefix/connect, subscribes to prefix/listen)
@@ -1566,6 +1583,8 @@ def do_receive(args, env_config: dict):
         idle = 0
         with open(str(out_file), "wb") as f, make_progress_bar(total_size, desc) as pbar:
             while expected < total_chunks:
+                if stop_event is not None and stop_event.is_set():
+                    raise KeyboardInterrupt
                 if broker_lost(client):
                     raise ConnectionError("lost connection to broker")
                 tag, body = recv_message(client, timeout=recv_timeout)
