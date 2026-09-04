@@ -27,6 +27,17 @@ import com.google.android.material.tabs.TabLayout
 import com.google.android.material.textfield.MaterialAutoCompleteTextView
 import org.json.JSONObject
 import java.io.File
+import android.app.AlertDialog
+import android.graphics.Bitmap
+import android.text.Editable
+import android.text.TextWatcher
+import android.widget.ImageView
+import com.google.zxing.BarcodeFormat
+import com.journeyapps.barcodescanner.BarcodeEncoder
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
+import java.net.URLDecoder
+import java.net.URLEncoder
 
 class MainActivity : AppCompatActivity() {
 
@@ -48,6 +59,9 @@ class MainActivity : AppCompatActivity() {
         registerForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
             uri?.let { onSaveLocation(it) }
         }
+    private var scanTarget = "FILES"
+    private val scan =
+        registerForActivityResult(ScanContract()) { r -> r?.contents?.let { onScan(it) } }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -110,6 +124,10 @@ class MainActivity : AppCompatActivity() {
         findViewById<Button>(R.id.stop).setOnClickListener {
             startService(Intent(this, TunnelService::class.java).setAction(TunnelService.ACTION_STOP))
         }
+        findViewById<Button>(R.id.tunShowQr).setOnClickListener {
+            showQrDialog(buildPayload(code.text.toString(), broker.text.toString(), key.text.toString()))
+        }
+        findViewById<Button>(R.id.tunScan).setOnClickListener { scanTarget = "TUNNEL"; launchScan() }
     }
 
     private fun setupFilesTab() {
@@ -118,6 +136,14 @@ class MainActivity : AppCompatActivity() {
         findViewById<Button>(R.id.pickFile).setOnClickListener { pickFile.launch(arrayOf("*/*")) }
         findViewById<Button>(R.id.whSend).setOnClickListener { startSend() }
         findViewById<Button>(R.id.whReceive).setOnClickListener { startReceive() }
+        findViewById<Button>(R.id.whScan).setOnClickListener { scanTarget = "FILES"; launchScan() }
+        val refresh = object : TextWatcher {
+            override fun afterTextChanged(s: Editable?) { refreshSendQr() }
+            override fun beforeTextChanged(a: CharSequence?, b: Int, c: Int, d: Int) {}
+            override fun onTextChanged(a: CharSequence?, b: Int, c: Int, d: Int) {}
+        }
+        findViewById<EditText>(R.id.whKey).addTextChangedListener(refresh)
+        findViewById<EditText>(R.id.whBroker).addTextChangedListener(refresh)
     }
 
     private fun onPicked(uri: Uri) {
@@ -138,6 +164,7 @@ class MainActivity : AppCompatActivity() {
         codeView.text = sendCodeStr
         codeView.visibility = View.VISIBLE
         findViewById<Button>(R.id.whSend).isEnabled = true
+        refreshSendQr()
     }
 
     private fun startSend() {
@@ -241,6 +268,66 @@ class MainActivity : AppCompatActivity() {
                 ui.postDelayed(this, 700)
             }
         })
+    }
+
+    private fun launchScan() {
+        scan.launch(ScanOptions()
+            .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+            .setBeepEnabled(false).setOrientationLocked(false)
+            .setPrompt("Scan pairing QR"))
+    }
+
+    private fun qrBitmap(text: String): Bitmap =
+        BarcodeEncoder().encodeBitmap(text, BarcodeFormat.QR_CODE, 512, 512)
+
+    private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
+
+    private fun buildPayload(code: String, broker: String, key: String): String {
+        val sb = StringBuilder("mqttpipe:code=").append(enc(code))
+        if (broker.isNotEmpty()) sb.append("&broker=").append(enc(broker))
+        if (key.isNotEmpty()) sb.append("&key=").append(enc(key))
+        return sb.toString()
+    }
+
+    private fun onScan(text: String) {
+        val m = HashMap<String, String>()
+        if (text.startsWith("mqttpipe:")) {
+            for (kv in text.removePrefix("mqttpipe:").split("&")) {
+                val i = kv.indexOf('=')
+                if (i > 0) m[kv.substring(0, i)] = URLDecoder.decode(kv.substring(i + 1), "UTF-8")
+            }
+        } else m["code"] = text.trim()
+        val code = m["code"] ?: ""; val broker = m["broker"] ?: ""; val key = m["key"] ?: ""
+        if (scanTarget == "TUNNEL") {
+            if (code.isNotEmpty()) findViewById<EditText>(R.id.code).setText(code)
+            if (broker.isNotEmpty()) findViewById<EditText>(R.id.broker).setText(broker)
+            if (key.isNotEmpty()) findViewById<EditText>(R.id.key).setText(key)
+        } else {
+            if (code.isNotEmpty()) findViewById<EditText>(R.id.whRecvCode).setText(code)
+            if (broker.isNotEmpty()) findViewById<EditText>(R.id.whBroker).setText(broker)
+            if (key.isNotEmpty()) findViewById<EditText>(R.id.whKey).setText(key)
+        }
+        toast("Scanned code: $code")
+    }
+
+    private fun refreshSendQr() {
+        val iv = findViewById<ImageView>(R.id.whSendQr)
+        if (sendCodeStr.isEmpty()) { iv.visibility = View.GONE; return }
+        try {
+            iv.setImageBitmap(qrBitmap(buildPayload(
+                sendCodeStr,
+                findViewById<EditText>(R.id.whBroker).text.toString(),
+                findViewById<EditText>(R.id.whKey).text.toString())))
+            iv.visibility = View.VISIBLE
+        } catch (e: Exception) { iv.visibility = View.GONE }
+    }
+
+    private fun showQrDialog(payload: String) {
+        val iv = ImageView(this)
+        iv.setImageBitmap(qrBitmap(payload))
+        iv.setPadding(32, 32, 32, 32)
+        AlertDialog.Builder(this).setTitle("Scan to pair").setView(iv)
+            .setPositiveButton("Close", null).show()
     }
 
     private fun ensureBatteryExemption() {
