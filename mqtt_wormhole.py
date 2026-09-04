@@ -32,7 +32,8 @@ except ImportError:
 # Add parent directory to path so we can import mqtt_cat
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mqtt_cat import (MQTTNetcat, COMPRESSION_TYPES, COMPRESSION_NONE, HAVE_CRYPTOGRAPHY,
-                      BUILTIN_PROFILES, set_force_fallback)
+                      BUILTIN_PROFILES, set_force_fallback,
+                      print_pairing_qr)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 WORDLIST_FILE = os.path.join(SCRIPT_DIR, "wordlist.txt")
@@ -955,6 +956,8 @@ def do_send(args, env_config: dict, stop_event=None):
     profile = build_profile(args, env_config)
     
     code = args.code or generate_code()
+    if getattr(args, "qr", False):
+        print_pairing_qr(code, args.broker or "", args.encryption_key or "")
     enc_config = get_encryption_config(args, env_config, code)
     transfer_config = get_transfer_config(args, env_config)
 
@@ -1776,6 +1779,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
     parser.add_argument("--log-file", type=str, default=None, help=f"Log file path (default: {DEFAULT_LOG_FILE})")
 
+    parser.add_argument("--qr", action="store_true",
+                        help="Show a scannable QR of the pairing code for the mobile app")
     return parser
 
 
