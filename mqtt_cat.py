@@ -45,7 +45,15 @@ try:
     import qrcode
     HAVE_QRCODE = True
 except ImportError:
-    HAVE_QRCODE = False
+    # Fall back to the copy vendored under _vendor/ so --qr works without pip.
+    try:
+        _vendor_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_vendor")
+        if _vendor_dir not in sys.path:
+            sys.path.insert(0, _vendor_dir)
+        import qrcode
+        HAVE_QRCODE = True
+    except ImportError:
+        HAVE_QRCODE = False
 
 # When True, every Encryptor uses the stdlib fallback scheme even if cryptography is
 # installed — e.g. to interoperate with a peer that lacks cryptography. Toggle via
