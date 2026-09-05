@@ -1376,7 +1376,11 @@ def setup_logging(log_file: str, verbose: bool = False):
 # ─── Reconnect wrapper ───────────────────────────────────────────────────────
 
 # Reasons that mean "give up"; every other reason is a transient drop we retry.
-_TERMINAL_REASONS = {"stopped", "fatal", "auth_failed", "config", "error", "done"}
+# peer_gone = the server sent BYE (graceful shutdown); if it deliberately left,
+# the client leaves too instead of reconnecting into a dead tunnel. A crashed or
+# timed-out server is peer_dead/mqtt_lost — still retried, since it may come back.
+_TERMINAL_REASONS = {"stopped", "fatal", "auth_failed", "config", "error", "done",
+                     "peer_gone"}
 
 
 def serve_forever(fn, args, env_config):
