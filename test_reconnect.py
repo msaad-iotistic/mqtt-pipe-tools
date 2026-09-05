@@ -32,8 +32,19 @@ def test_no_reconnect_passes_through():
     assert r == "mqtt_lost", r
 
 
+def test_server_bye_stops_client():
+    # A graceful server BYE (peer_gone) is terminal: the client stops instead of
+    # reconnecting. A crashed server (peer_dead) is still retried.
+    calls = []
+    def fn(a, e):
+        calls.append(1); return "peer_gone"
+    r = mqtt_forward.serve_forever(fn, _args(), {})
+    assert r == "peer_gone" and len(calls) == 1, (r, calls)
+
+
 if __name__ == "__main__":
     test_retries_transient_then_stops_on_terminal()
     test_fatal_is_not_retried()
     test_no_reconnect_passes_through()
+    test_server_bye_stops_client()
     print("test_reconnect: OK")
