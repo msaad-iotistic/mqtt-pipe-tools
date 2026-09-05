@@ -22,6 +22,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import com.chaquo.python.Python
 import com.chaquo.python.android.AndroidPlatform
+import com.google.android.material.materialswitch.MaterialSwitch
 import com.google.android.material.progressindicator.LinearProgressIndicator
 import com.google.android.material.tabs.TabLayout
 import com.google.android.material.textfield.MaterialAutoCompleteTextView
@@ -119,12 +120,7 @@ class MainActivity : AppCompatActivity() {
 
         findViewById<Button>(R.id.start).setOnClickListener {
             ensureBatteryExemption()
-            val cfg = JSONObject()
-                .put("mode", mode.text.toString())
-                .put("address", address.text.toString())
-                .put("broker", broker.text.toString())
-                .put("code", code.text.toString())
-                .put("key", key.text.toString())
+            val cfg = tunnelConfig()
             saveHistory(cfg)
             ContextCompat.startForegroundService(this,
                 Intent(this, TunnelService::class.java)
@@ -134,12 +130,35 @@ class MainActivity : AppCompatActivity() {
         findViewById<Button>(R.id.stop).setOnClickListener {
             startService(Intent(this, TunnelService::class.java).setAction(TunnelService.ACTION_STOP))
         }
+        toggleView(R.id.tunAdvToggle, R.id.tunAdvanced)
         findViewById<Button>(R.id.tunFromCmd).setOnClickListener { showFromCommandDialog() }
         findViewById<Button>(R.id.tunRecent).setOnClickListener { showHistoryDialog() }
         findViewById<Button>(R.id.tunShowQr).setOnClickListener {
             showQrDialog(buildPayload(code.text.toString(), broker.text.toString(), key.text.toString()))
         }
         findViewById<Button>(R.id.tunScan).setOnClickListener { scanTarget = "TUNNEL"; launchScan() }
+    }
+
+    // One source of truth for the tunnel config: reads every field, incl. the
+    // custom broker and free-form extra args. A custom host overrides the preset.
+    private fun tunnelConfig(): JSONObject {
+        val o = JSONObject()
+            .put("mode", findViewById<MaterialAutoCompleteTextView>(R.id.mode).text.toString())
+            .put("address", findViewById<EditText>(R.id.address).text.toString())
+            .put("code", findViewById<EditText>(R.id.code).text.toString())
+            .put("key", findViewById<EditText>(R.id.key).text.toString())
+        val host = findViewById<EditText>(R.id.tunHost).text.toString().trim()
+        if (host.isNotEmpty()) {
+            o.put("host", host)
+            findViewById<EditText>(R.id.tunPort).text.toString().trim().ifEmpty { null }?.let { o.put("port", it) }
+            findViewById<EditText>(R.id.tunUser).text.toString().trim().ifEmpty { null }?.let { o.put("username", it) }
+            findViewById<EditText>(R.id.tunPass).text.toString().ifEmpty { null }?.let { o.put("password", it) }
+            if (findViewById<MaterialSwitch>(R.id.tunTls).isChecked) o.put("tls", true)
+        } else {
+            o.put("broker", findViewById<EditText>(R.id.broker).text.toString())
+        }
+        findViewById<EditText>(R.id.tunExtra).text.toString().trim().ifEmpty { null }?.let { o.put("extra_args", it) }
+        return o
     }
 
     private fun applyTunnelConfig(o: JSONObject) {
@@ -149,6 +168,22 @@ class MainActivity : AppCompatActivity() {
         fun set(id: Int, k: String) { if (o.has(k)) findViewById<EditText>(id).setText(o.optString(k)) }
         set(R.id.address, "address"); set(R.id.broker, "broker")
         set(R.id.code, "code"); set(R.id.key, "key")
+        set(R.id.tunHost, "host"); set(R.id.tunPort, "port")
+        set(R.id.tunUser, "username"); set(R.id.tunPass, "password")
+        set(R.id.tunExtra, "extra_args")
+        findViewById<MaterialSwitch>(R.id.tunTls).isChecked = o.optBoolean("tls", false)
+        // A custom host overrides the preset, so clear the preset to avoid confusion.
+        if (o.has("host")) findViewById<EditText>(R.id.broker).setText("")
+        // Reveal the advanced section when the pasted command actually used it.
+        if (o.has("host") || o.has("extra_args") || o.optBoolean("tls", false))
+            findViewById<View>(R.id.tunAdvanced).visibility = View.VISIBLE
+    }
+
+    private fun toggleView(btnId: Int, viewId: Int) {
+        findViewById<Button>(btnId).setOnClickListener {
+            val v = findViewById<View>(viewId)
+            v.visibility = if (v.visibility == View.GONE) View.VISIBLE else View.GONE
+        }
     }
 
     private fun showFromCommandDialog() {
@@ -202,6 +237,7 @@ class MainActivity : AppCompatActivity() {
         findViewById<Button>(R.id.whSend).setOnClickListener { startSend() }
         findViewById<Button>(R.id.whReceive).setOnClickListener { startReceive() }
         findViewById<Button>(R.id.whScan).setOnClickListener { scanTarget = "FILES"; launchScan() }
+        toggleView(R.id.whAdvToggle, R.id.whAdvanced)
         val refresh = object : TextWatcher {
             override fun afterTextChanged(s: Editable?) { refreshSendQr() }
             override fun beforeTextChanged(a: CharSequence?, b: Int, c: Int, d: Int) {}
@@ -235,11 +271,8 @@ class MainActivity : AppCompatActivity() {
     private fun startSend() {
         val path = sendPath ?: return
         ensureBatteryExemption()
-        val cfg = JSONObject()
-            .put("file_path", path)
-            .put("code", sendCodeStr)
-            .put("broker", findViewById<EditText>(R.id.whBroker).text.toString())
-            .put("key", findViewById<EditText>(R.id.whKey).text.toString())
+        val cfg = JSONObject().put("file_path", path).put("code", sendCodeStr)
+        putFileConn(cfg)
         awaitingReceive = false
         ContextCompat.startForegroundService(this,
             Intent(this, WormholeService::class.java)
@@ -253,17 +286,29 @@ class MainActivity : AppCompatActivity() {
         if (code.isEmpty()) { toast("Enter a pairing code"); return }
         ensureBatteryExemption()
         val outDir = File(cacheDir, "received"); outDir.mkdirs()
-        val cfg = JSONObject()
-            .put("out_dir", outDir.absolutePath)
-            .put("code", code)
-            .put("broker", findViewById<EditText>(R.id.whBroker).text.toString())
-            .put("key", findViewById<EditText>(R.id.whKey).text.toString())
+        val cfg = JSONObject().put("out_dir", outDir.absolutePath).put("code", code)
+        putFileConn(cfg)
         awaitingReceive = true
         ContextCompat.startForegroundService(this,
             Intent(this, WormholeService::class.java)
                 .setAction(WormholeService.ACTION_WH_RECEIVE)
                 .putExtra(WormholeService.EXTRA_CONFIG, cfg.toString()))
         whProgress.visibility = View.VISIBLE
+    }
+
+    // Broker + encryption for a wormhole transfer. A custom host overrides the preset.
+    private fun putFileConn(o: JSONObject) {
+        val host = findViewById<EditText>(R.id.whHost).text.toString().trim()
+        if (host.isNotEmpty()) {
+            o.put("host", host)
+            findViewById<EditText>(R.id.whPort).text.toString().trim().ifEmpty { null }?.let { o.put("port", it) }
+            findViewById<EditText>(R.id.whUser).text.toString().trim().ifEmpty { null }?.let { o.put("username", it) }
+            findViewById<EditText>(R.id.whPass).text.toString().ifEmpty { null }?.let { o.put("password", it) }
+            if (findViewById<MaterialSwitch>(R.id.whTls).isChecked) o.put("tls", true)
+        } else {
+            o.put("broker", findViewById<EditText>(R.id.whBroker).text.toString())
+        }
+        o.put("key", findViewById<EditText>(R.id.whKey).text.toString())
     }
 
     private fun onSaveLocation(uri: Uri) {

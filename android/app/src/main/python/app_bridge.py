@@ -56,6 +56,12 @@ def _build_argv(cfg):
 
     if cfg.get("key"):
         argv += ["--encryption-key", cfg["key"]]
+    # Any flags the UI has no field for (from a pasted command or the Extra args
+    # box) ride along verbatim, so the full mqtt_forward CLI is reachable.
+    extra = cfg.get("extra_args")
+    if extra:
+        import shlex
+        argv += shlex.split(extra) if isinstance(extra, str) else list(extra)
     return argv
 
 
@@ -113,23 +119,49 @@ def parse_command(text):
         toks = shlex.split((text or "").strip())
     except ValueError:
         toks = (text or "").split()
+    import shlex
     while toks and not toks[0].startswith("-"):
         toks.pop(0)  # strip the program name/invocation
+    parser = mqtt_forward.build_parser()
     try:
-        args, _ = mqtt_forward.build_parser().parse_known_args(toks)
+        args, _ = parser.parse_known_args(toks)
     except SystemExit:
         return json.dumps({"error": "could not parse command"})
+
     cfg = {}
     if args.listen:
         cfg["mode"], cfg["address"] = "listen", args.listen
     elif args.connect:
         cfg["mode"], cfg["address"] = "connect", args.connect
-    if args.code:
-        cfg["code"] = args.code
-    if getattr(args, "broker", None):
-        cfg["broker"] = args.broker
-    if getattr(args, "encryption_key", None):
-        cfg["key"] = args.encryption_key
+    # Fields the UI has dedicated inputs for (incl. custom broker host/port/etc).
+    for dest, key in (("code", "code"), ("broker", "broker"), ("encryption_key", "key"),
+                      ("host", "host"), ("port", "port"),
+                      ("username", "username"), ("password", "password")):
+        v = getattr(args, dest, None)
+        if v:
+            cfg[key] = str(v)
+    if getattr(args, "tls", False):
+        cfg["tls"] = True
+
+    # Every other flag the command set is passed straight to the forwarder via
+    # extra_args, reconstructed canonically from argparse so all spellings work.
+    ui_dests = {"listen", "connect", "code", "broker", "encryption_key",
+                "host", "port", "username", "password", "tls", "help"}
+    extra = []
+    for a in parser._actions:
+        if not a.option_strings or a.dest in ui_dests:
+            continue
+        val = getattr(args, a.dest, None)
+        if val is None or val == a.default:
+            continue  # not set (or set to its default → a no-op)
+        flag = max(a.option_strings, key=len)  # prefer the long form
+        if a.nargs == 0:  # store_true / count flags carry no value
+            extra.append(flag)
+        else:
+            extra.extend([flag, str(val)])
+    if extra:
+        cfg["extra_args"] = " ".join(shlex.quote(x) for x in extra)
+
     if not cfg:
         return json.dumps({"error": "no --listen or --connect in command"})
     return json.dumps(cfg)
