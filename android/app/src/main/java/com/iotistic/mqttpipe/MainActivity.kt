@@ -25,6 +25,7 @@ import com.chaquo.python.android.AndroidPlatform
 import com.google.android.material.progressindicator.LinearProgressIndicator
 import com.google.android.material.tabs.TabLayout
 import com.google.android.material.textfield.MaterialAutoCompleteTextView
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import android.app.AlertDialog
@@ -41,6 +42,7 @@ import java.net.URLEncoder
 
 class MainActivity : AppCompatActivity() {
 
+    private val DEFAULT_LISTEN = "127.0.0.1:2222"
     private val ui = Handler(Looper.getMainLooper())
     private lateinit var statusView: TextView
     private lateinit var whStatus: TextView
@@ -108,6 +110,13 @@ class MainActivity : AppCompatActivity() {
         val key = findViewById<EditText>(R.id.key)
         statusView = findViewById(R.id.status)
 
+        // Sensible default so listen mode is one tap; only prefill when empty.
+        if (address.text.isNullOrBlank()) address.setText(DEFAULT_LISTEN)
+        mode.setOnItemClickListener { _, _, _, _ ->
+            if (mode.text.toString() == "listen" && address.text.isNullOrBlank())
+                address.setText(DEFAULT_LISTEN)
+        }
+
         findViewById<Button>(R.id.start).setOnClickListener {
             ensureBatteryExemption()
             val cfg = JSONObject()
@@ -116,6 +125,7 @@ class MainActivity : AppCompatActivity() {
                 .put("broker", broker.text.toString())
                 .put("code", code.text.toString())
                 .put("key", key.text.toString())
+            saveHistory(cfg)
             ContextCompat.startForegroundService(this,
                 Intent(this, TunnelService::class.java)
                     .setAction(TunnelService.ACTION_START)
@@ -124,10 +134,65 @@ class MainActivity : AppCompatActivity() {
         findViewById<Button>(R.id.stop).setOnClickListener {
             startService(Intent(this, TunnelService::class.java).setAction(TunnelService.ACTION_STOP))
         }
+        findViewById<Button>(R.id.tunFromCmd).setOnClickListener { showFromCommandDialog() }
+        findViewById<Button>(R.id.tunRecent).setOnClickListener { showHistoryDialog() }
         findViewById<Button>(R.id.tunShowQr).setOnClickListener {
             showQrDialog(buildPayload(code.text.toString(), broker.text.toString(), key.text.toString()))
         }
         findViewById<Button>(R.id.tunScan).setOnClickListener { scanTarget = "TUNNEL"; launchScan() }
+    }
+
+    private fun applyTunnelConfig(o: JSONObject) {
+        o.optString("mode").takeIf { it.isNotEmpty() }?.let {
+            findViewById<MaterialAutoCompleteTextView>(R.id.mode).setText(it, false)
+        }
+        fun set(id: Int, k: String) { if (o.has(k)) findViewById<EditText>(id).setText(o.optString(k)) }
+        set(R.id.address, "address"); set(R.id.broker, "broker")
+        set(R.id.code, "code"); set(R.id.key, "key")
+    }
+
+    private fun showFromCommandDialog() {
+        val et = EditText(this)
+        et.hint = "mqtt-forward --connect host:22 --broker emqx --code …"
+        et.setPadding(48, 32, 48, 32)
+        AlertDialog.Builder(this).setTitle("Start from command").setView(et)
+            .setPositiveButton("Fill") { _, _ ->
+                val out = Python.getInstance().getModule("app_bridge")
+                    .callAttr("parse_command", et.text.toString()).toString()
+                val o = JSONObject(out)
+                if (o.has("error")) toast(o.getString("error"))
+                else { applyTunnelConfig(o); toast("Filled from command") }
+            }
+            .setNegativeButton("Cancel", null).show()
+    }
+
+    private fun histPrefs() = getSharedPreferences("history", Context.MODE_PRIVATE)
+
+    private fun saveHistory(cfg: JSONObject) {
+        // Most-recent-first, drop an identical earlier entry, cap at 10.
+        val prev = JSONArray(histPrefs().getString("tunnel", "[]"))
+        val out = JSONArray().put(cfg)
+        val seen = cfg.toString()
+        var i = 0
+        while (i < prev.length() && out.length() < 10) {
+            val o = prev.getJSONObject(i); i++
+            if (o.toString() != seen) out.put(o)
+        }
+        histPrefs().edit().putString("tunnel", out.toString()).apply()
+    }
+
+    private fun showHistoryDialog() {
+        val arr = JSONArray(histPrefs().getString("tunnel", "[]"))
+        if (arr.length() == 0) { toast("No saved sessions yet"); return }
+        val labels = Array(arr.length()) { i ->
+            val o = arr.getJSONObject(i)
+            val c = o.optString("code")
+            "${o.optString("mode")} ${o.optString("address")} · ${o.optString("broker")}" +
+                    (if (c.isNotEmpty()) " · $c" else "")
+        }
+        AlertDialog.Builder(this).setTitle("Recent sessions")
+            .setItems(labels) { _, i -> applyTunnelConfig(arr.getJSONObject(i)); toast("Loaded") }
+            .setNegativeButton("Close", null).show()
     }
 
     private fun setupFilesTab() {

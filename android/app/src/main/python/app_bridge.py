@@ -101,6 +101,40 @@ def status():
         return json.dumps(_status)
 
 
+def parse_command(text):
+    """Parse a pasted `mqtt-forward …` command into a tunnel config JSON.
+
+    Reuses the real argparse so every flag spelling works. Leading program tokens
+    (mqtt-forward / python mqtt_forward.py / ./…) are dropped since the parser has
+    no positional args. Returns {"error": …} on a bad command.
+    """
+    import shlex
+    try:
+        toks = shlex.split((text or "").strip())
+    except ValueError:
+        toks = (text or "").split()
+    while toks and not toks[0].startswith("-"):
+        toks.pop(0)  # strip the program name/invocation
+    try:
+        args, _ = mqtt_forward.build_parser().parse_known_args(toks)
+    except SystemExit:
+        return json.dumps({"error": "could not parse command"})
+    cfg = {}
+    if args.listen:
+        cfg["mode"], cfg["address"] = "listen", args.listen
+    elif args.connect:
+        cfg["mode"], cfg["address"] = "connect", args.connect
+    if args.code:
+        cfg["code"] = args.code
+    if getattr(args, "broker", None):
+        cfg["broker"] = args.broker
+    if getattr(args, "encryption_key", None):
+        cfg["key"] = args.encryption_key
+    if not cfg:
+        return json.dumps({"error": "no --listen or --connect in command"})
+    return json.dumps(cfg)
+
+
 # ─── Wormhole file transfer ──────────────────────────────────────────────────
 import os
 
