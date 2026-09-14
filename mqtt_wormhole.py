@@ -1037,11 +1037,15 @@ def do_send(args, env_config: dict, stop_event=None):
         print("Waiting for receiver to connect...", file=sys.stderr)
         logger.info("Waiting for receiver READY message")
         while True:
+            # ponytail: poll stop_event so an embedded (Android) caller can cancel
+            # while waiting for a receiver; short timeout keeps the loop responsive.
+            if stop_event is not None and stop_event.is_set():
+                raise KeyboardInterrupt
             if broker_lost(client):
                 print("\nError: lost connection to broker.", file=sys.stderr)
                 cleanup()
                 sys.exit(1)
-            msg = recv_control(client, timeout=3600)
+            msg = recv_control(client, timeout=2)
             if peer_stopped(msg):
                 print(f"\nReceiver ended the transfer: {msg.get('message', 'disconnected')}",
                       file=sys.stderr)
@@ -1358,6 +1362,10 @@ def do_receive(args, env_config: dict, stop_event=None):
         # Send READY until we get a response, then wait for metadata
         while metadata is None:
             now = time.monotonic()
+            # ponytail: poll stop_event so an embedded (Android) caller can cancel
+            # while waiting for a sender (this loop waits indefinitely otherwise).
+            if stop_event is not None and stop_event.is_set():
+                raise KeyboardInterrupt
             if broker_lost(client):
                 print("\nError: lost connection to broker.", file=sys.stderr)
                 cleanup()

@@ -61,7 +61,7 @@ class WormholeService : Service() {
                             else -> o.optString("detail").ifEmpty { st }
                         }
                         nm.notify(NOTIF_ID, notification(text, pct))
-                        if (st == "done" || st == "error" || st == "idle") break
+                        if (st == "done" || st == "error" || st == "idle" || st == "stopped") break
                         Thread.sleep(700)
                     }
                     stopForeground(STOP_FOREGROUND_REMOVE)

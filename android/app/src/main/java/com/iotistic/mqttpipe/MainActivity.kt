@@ -260,6 +260,9 @@ class MainActivity : AppCompatActivity() {
         findViewById<Button>(R.id.whReceive).setOnClickListener { startReceive() }
         findViewById<Button>(R.id.whScan).setOnClickListener { scanTarget = "FILES"; launchScan() }
         findViewById<Button>(R.id.whFromCmd).setOnClickListener { showWormholeCommandDialog() }
+        findViewById<Button>(R.id.whStop).setOnClickListener {
+            startService(Intent(this, WormholeService::class.java).setAction(WormholeService.ACTION_WH_STOP))
+        }
         toggleView(R.id.whAdvToggle, R.id.whAdvanced)
         val refresh = object : TextWatcher {
             override fun afterTextChanged(s: Editable?) { refreshSendQr() }
@@ -402,7 +405,17 @@ class MainActivity : AppCompatActivity() {
                 val state = o.optString("state")
                 val pct = o.optInt("percent")
                 val kind = o.optString("kind")
+                val active = state == "running" || state == "starting"
+                val contacted = o.optBoolean("contacted")
+                val waitingS = o.optInt("waiting_s")
+                // Until the peer makes contact a transfer is just waiting; after a
+                // grace period say so plainly ("no sender/receiver on this code").
+                val peer = if (kind == "send") "receiver" else "sender"
                 val label = when {
+                    active && !contacted && waitingS >= 10 ->
+                        "No $peer on this code yet — check the broker & code"
+                    active && !contacted ->
+                        "Waiting for $peer…"
                     state == "running" && kind == "send" ->
                         "Uploading" + (if (pct in 1..99) " $pct%" else "…")
                     state == "running" && kind == "receive" ->
@@ -410,16 +423,19 @@ class MainActivity : AppCompatActivity() {
                     else -> (state + "  " + o.optString("detail")).trim()
                 }
                 whStatus.text = ("● " + label).trim()
-                whStatus.setTextColor(statusColor(state))
-                when (state) {
-                    "running", "starting" -> {
+                whStatus.setTextColor(if (active && !contacted && waitingS >= 10) 0xFFF9A825.toInt()
+                                      else statusColor(state))
+                when {
+                    active && !contacted -> { whProgress.visibility = View.VISIBLE; whProgress.isIndeterminate = true }
+                    state == "running" || state == "starting" -> {
                         whProgress.visibility = View.VISIBLE
                         if (pct > 0) { whProgress.isIndeterminate = false; whProgress.progress = pct }
                         else whProgress.isIndeterminate = true
                     }
-                    "done" -> { whProgress.isIndeterminate = false; whProgress.progress = 100 }
-                    else -> whProgress.visibility = View.GONE   // idle/error/stopping: clear the bar
+                    state == "done" -> { whProgress.isIndeterminate = false; whProgress.progress = 100 }
+                    else -> whProgress.visibility = View.GONE   // idle/error/stopped: clear the bar
                 }
+                findViewById<Button>(R.id.whStop).visibility = if (active) View.VISIBLE else View.GONE
                 updateConn(findViewById(R.id.whConn), o.optString("conn"), state, reconnecting = false)
                 if (awaitingReceive && state == "done") {
                     awaitingReceive = false

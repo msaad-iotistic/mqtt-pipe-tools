@@ -8,6 +8,7 @@ import collections
 import json
 import sys
 import threading
+import time
 
 import mqtt_forward  # copied alongside this file; pulls in mqtt_cat + vendored paho
 
@@ -214,6 +215,12 @@ _wh_stop = None
 _wh_client = None
 _wh_lock = threading.Lock()
 _wh_status = {"state": "idle", "detail": "", "percent": 0, "file": "", "kind": ""}
+# "Contact" = the peer started the real exchange. A progress bar is only created
+# once metadata has been exchanged (receive: after the sender's manifest; send:
+# after the receiver's READY), so bar creation is a reliable "peer is here" signal.
+# Until then a receiver is just waiting — which is how we surface "no sender yet".
+_wh_contacted = False
+_wh_start_at = 0.0
 
 # Capture the wormhole client too, for the broker-connection indicator.
 _orig_wh_create_client = mqtt_wormhole.create_client
@@ -260,6 +267,8 @@ class _ProgressProxy:
     def __getattr__(self, name):
         return getattr(self._bar, name)  # _bar is in __dict__, so no recursion
 def _make_progress_bar_hook(total, desc):
+    global _wh_contacted
+    _wh_contacted = True  # a bar means the peer is here and the transfer is starting
     return _ProgressProxy(_orig_make_progress_bar(total, desc))
 mqtt_wormhole.make_progress_bar = _make_progress_bar_hook
 
@@ -343,6 +352,9 @@ def _wh_run_send(cfg, stop_event):
         sys.stderr = tee
         mqtt_wormhole.do_send(args, env, stop_event=stop_event)
         sys.stderr = old
+        if stop_event.is_set():        # user cancelled (do_send returns via KeyboardInterrupt)
+            _wh_set("stopped", "cancelled")
+            return
         with _wh_lock:
             _wh_status["percent"] = 100
         _wh_set("done", "sent")
@@ -370,6 +382,9 @@ def _wh_run_receive(cfg, stop_event):
         sys.stderr = tee
         mqtt_wormhole.do_receive(args, env, stop_event=stop_event)
         sys.stderr = old
+        if stop_event.is_set():        # user cancelled while waiting/receiving
+            _wh_set("stopped", "cancelled")
+            return
         files = [os.path.join(out, f) for f in os.listdir(out)]
         files = [f for f in files if os.path.isfile(f)
                  and not f.endswith(".part") and not os.path.basename(f).startswith(".")]
@@ -393,12 +408,14 @@ def wormhole_new_code():
 
 
 def _wh_start(target, config_json):
-    global _wh_thread, _wh_stop, _wh_client
+    global _wh_thread, _wh_stop, _wh_client, _wh_contacted, _wh_start_at
     if _wh_thread is not None and _wh_thread.is_alive():
         return False
     cfg = json.loads(config_json)
     _wh_stop = threading.Event()
     _wh_client = None  # captured afresh when do_send/do_receive connects
+    _wh_contacted = False
+    _wh_start_at = time.monotonic()
     with _wh_lock:
         _wh_status.update({"state": "starting", "detail": "", "percent": 0, "file": "", "kind": ""})
     _wh_thread = threading.Thread(target=target, args=(cfg, _wh_stop), daemon=True)
@@ -426,6 +443,10 @@ def wh_status():
     with _wh_lock:
         s = dict(_wh_status)
     s["conn"] = _conn_of(_wh_client)
+    s["contacted"] = _wh_contacted
+    # Seconds spent waiting before the peer showed up — the UI turns a long wait
+    # into "no sender/receiver on this code yet".
+    s["waiting_s"] = int(time.monotonic() - _wh_start_at) if not _wh_contacted else 0
     return json.dumps(s)
 
 

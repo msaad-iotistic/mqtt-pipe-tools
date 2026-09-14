@@ -410,6 +410,11 @@
             <TextView android:id="@+id/whStatus" android:layout_width="match_parent"
                 android:layout_height="wrap_content" android:layout_marginTop="8dp"
                 android:textIsSelectable="true" android:text="" />
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/whStop" style="@style/Widget.Material3.Button.OutlinedButton"
+                android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:layout_marginTop="8dp" android:visibility="gone"
+                android:text="Stop transfer" />
         </LinearLayout>
     </LinearLayout>
 </ScrollView>
