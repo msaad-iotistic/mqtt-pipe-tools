@@ -48,11 +48,19 @@ class WormholeService : Service() {
                 bridge().callAttr(if (send) "wormhole_send" else "wormhole_receive", cfg)
                 Thread {
                     val nm = getSystemService(NotificationManager::class.java)
+                    val verb = if (send) "Uploading" else "Downloading"
                     while (true) {
                         val o = JSONObject(bridge().callAttr("wh_status").toString())
                         val st = o.optString("state")
                         val pct = o.optInt("percent")
-                        nm.notify(NOTIF_ID, notification("${if (send) "Sending" else "Receiving"}: $st", pct))
+                        // While transferring show the direction+%, otherwise the detail
+                        // (e.g. "sent", "receiver disconnected", "broker disconnected").
+                        val text = when (st) {
+                            "running", "starting" ->
+                                verb + (if (pct in 1..99) " $pct%" else "…")
+                            else -> o.optString("detail").ifEmpty { st }
+                        }
+                        nm.notify(NOTIF_ID, notification(text, pct))
                         if (st == "done" || st == "error" || st == "idle") break
                         Thread.sleep(700)
                     }

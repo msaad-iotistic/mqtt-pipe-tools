@@ -186,19 +186,41 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun showFromCommandDialog() {
+    private fun showFromCommandDialog() = showCommandDialog(
+        "Start from command", "mqtt-forward --connect host:22 --broker emqx --code …",
+        "parse_command", ::applyTunnelConfig)
+
+    private fun showWormholeCommandDialog() = showCommandDialog(
+        "Receive from command", "mqtt-wormhole --receive --code … --broker emqx",
+        "parse_wormhole_command", ::applyFilesConfig)
+
+    private fun showCommandDialog(title: String, hint: String, parseFn: String,
+                                  apply: (JSONObject) -> Unit) {
         val et = EditText(this)
-        et.hint = "mqtt-forward --connect host:22 --broker emqx --code …"
+        et.hint = hint
         et.setPadding(48, 32, 48, 32)
-        AlertDialog.Builder(this).setTitle("Start from command").setView(et)
+        AlertDialog.Builder(this).setTitle(title).setView(et)
             .setPositiveButton("Fill") { _, _ ->
                 val out = Python.getInstance().getModule("app_bridge")
-                    .callAttr("parse_command", et.text.toString()).toString()
+                    .callAttr(parseFn, et.text.toString()).toString()
                 val o = JSONObject(out)
                 if (o.has("error")) toast(o.getString("error"))
-                else { applyTunnelConfig(o); toast("Filled from command") }
+                else { apply(o); toast("Filled from command") }
             }
             .setNegativeButton("Cancel", null).show()
+    }
+
+    private fun applyFilesConfig(o: JSONObject) {
+        fun set(id: Int, k: String) { if (o.has(k)) findViewById<EditText>(id).setText(o.optString(k)) }
+        set(R.id.whBroker, "broker"); set(R.id.whKey, "key")
+        set(R.id.whHost, "host"); set(R.id.whPort, "port")
+        set(R.id.whUser, "username"); set(R.id.whPass, "password")
+        set(R.id.whExtra, "extra_args")
+        if (o.has("code")) findViewById<EditText>(R.id.whRecvCode).setText(o.optString("code"))
+        findViewById<MaterialSwitch>(R.id.whTls).isChecked = o.optBoolean("tls", false)
+        if (o.has("host")) findViewById<EditText>(R.id.whBroker).setText("")  // custom host overrides preset
+        if (o.has("host") || o.has("extra_args") || o.optBoolean("tls", false))
+            findViewById<View>(R.id.whAdvanced).visibility = View.VISIBLE
     }
 
     private fun histPrefs() = getSharedPreferences("history", Context.MODE_PRIVATE)
@@ -237,6 +259,7 @@ class MainActivity : AppCompatActivity() {
         findViewById<Button>(R.id.whSend).setOnClickListener { startSend() }
         findViewById<Button>(R.id.whReceive).setOnClickListener { startReceive() }
         findViewById<Button>(R.id.whScan).setOnClickListener { scanTarget = "FILES"; launchScan() }
+        findViewById<Button>(R.id.whFromCmd).setOnClickListener { showWormholeCommandDialog() }
         toggleView(R.id.whAdvToggle, R.id.whAdvanced)
         val refresh = object : TextWatcher {
             override fun afterTextChanged(s: Editable?) { refreshSendQr() }
@@ -309,6 +332,7 @@ class MainActivity : AppCompatActivity() {
             o.put("broker", findViewById<EditText>(R.id.whBroker).text.toString())
         }
         o.put("key", findViewById<EditText>(R.id.whKey).text.toString())
+        findViewById<EditText>(R.id.whExtra).text.toString().trim().ifEmpty { null }?.let { o.put("extra_args", it) }
     }
 
     private fun onSaveLocation(uri: Uri) {
@@ -339,6 +363,23 @@ class MainActivity : AppCompatActivity() {
         else -> 0xFF9E9E9E.toInt()
     }
 
+    // Broker line, shown only while a session is active. `reconnecting` is true for
+    // the tunnel (serve_forever retries a lost link) and false for one-shot transfers.
+    private fun updateConn(view: TextView, conn: String, state: String, reconnecting: Boolean) {
+        val active = state == "running" || state == "starting" || state == "error"
+        if (!active || conn.isEmpty()) { view.visibility = View.GONE; return }
+        val green = 0xFF2E7D32.toInt(); val amber = 0xFFF9A825.toInt(); val red = 0xFFC62828.toInt()
+        val (txt, col) = when (conn) {
+            "connected"  -> "🟢 Broker: connected" to green
+            "connecting" -> "🟡 Broker: connecting…" to amber
+            "denied"     -> "🔴 Broker: access denied (ACL)" to red
+            "lost"       -> if (reconnecting) "🟡 Broker: reconnecting…" to amber
+                            else "🔴 Broker: disconnected" to red
+            else         -> "" to red
+        }
+        view.text = txt; view.setTextColor(col); view.visibility = View.VISIBLE
+    }
+
     private fun pollStatus() {
         ui.post(object : Runnable {
             override fun run() {
@@ -347,6 +388,7 @@ class MainActivity : AppCompatActivity() {
                 val state = s.optString("state")
                 statusView.text = ("● " + state + "  " + s.optString("detail")).trim()
                 statusView.setTextColor(statusColor(state))
+                updateConn(findViewById(R.id.tunConn), s.optString("conn"), state, reconnecting = true)
                 ui.postDelayed(this, 1000)
             }
         })
@@ -359,8 +401,15 @@ class MainActivity : AppCompatActivity() {
                     .callAttr("wh_status").toString())
                 val state = o.optString("state")
                 val pct = o.optInt("percent")
-                whStatus.text = ("● " + state + "  " + o.optString("detail") +
-                        (if (pct in 1..99) "  $pct%" else "")).trim()
+                val kind = o.optString("kind")
+                val label = when {
+                    state == "running" && kind == "send" ->
+                        "Uploading" + (if (pct in 1..99) " $pct%" else "…")
+                    state == "running" && kind == "receive" ->
+                        "Downloading" + (if (pct in 1..99) " $pct%" else "…")
+                    else -> (state + "  " + o.optString("detail")).trim()
+                }
+                whStatus.text = ("● " + label).trim()
                 whStatus.setTextColor(statusColor(state))
                 when (state) {
                     "running", "starting" -> {
@@ -369,7 +418,9 @@ class MainActivity : AppCompatActivity() {
                         else whProgress.isIndeterminate = true
                     }
                     "done" -> { whProgress.isIndeterminate = false; whProgress.progress = 100 }
+                    else -> whProgress.visibility = View.GONE   // idle/error/stopping: clear the bar
                 }
+                updateConn(findViewById(R.id.whConn), o.optString("conn"), state, reconnecting = false)
                 if (awaitingReceive && state == "done") {
                     awaitingReceive = false
                     val f = o.optString("file")
